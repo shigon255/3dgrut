@@ -213,6 +213,43 @@ class Tracer:
             )
             self.num_update_bvh = 0 if rebuild_bvh else self.num_update_bvh + 1
 
+    def build_acc_dataclass(self, gaussians, rebuild=True):
+        """
+        gaussians contains activated gaussian parameters
+        gaussians is defined as
+        class dataclass_gs:
+            _opacities: torch.Tensor
+            _means: torch.Tensor
+            _rgbs: torch.Tensor
+            _scales: torch.Tensor
+            _quats: torch.Tensor
+            detach_keys: List[str]
+            _features_dc: Optional[torch.Tensor] = None
+            _features_rest: Optional[torch.Tensor] = None
+            extras: Optional[Dict[str, torch.Tensor]] = None
+        
+        properties can be accessed like 'gs.means'
+        """
+        with torch.cuda.nvtx.range(f"build-bvh-full-build-{rebuild}"):
+            allow_bvh_update = (
+                self.conf.render.max_consecutive_bvh_update > 1
+            ) and not self.conf.render.particle_kernel_density_clamping
+            rebuild_bvh = (
+                rebuild
+                or self.conf.render.particle_kernel_density_clamping
+                or self.num_update_bvh >= self.conf.render.max_consecutive_bvh_update
+            )
+            self.tracer_wrapper.build_bvh(
+                gaussians.means.view(-1, 3).contiguous(),
+                gaussians.quats.view(-1, 4).contiguous(),
+                gaussians.scales.view(-1, 3).contiguous(),
+                gaussians.opacities.view(-1, 1).contiguous(),
+                rebuild_bvh,
+                allow_bvh_update,
+            )
+            self.num_update_bvh = 0 if rebuild_bvh else self.num_update_bvh + 1
+
+
     def render(self, gaussians, gpu_batch: Batch, train=False, frame_id=0):
         num_gaussians = gaussians.num_gaussians
         with torch.cuda.nvtx.range(f"model.forward({num_gaussians} gaussians)"):
@@ -243,6 +280,54 @@ class Tracer:
                 gpu_batch.T_to_world.contiguous(), gpu_batch.rays_dir.contiguous(), pred_rgb, pred_opacity, train
             )
 
+        if self.frame_timer is not None:
+            self.timings["forward_render"] = self.frame_timer.timing()
+
+        return {
+            "pred_rgb": pred_rgb,
+            "pred_opacity": pred_opacity,
+            "pred_dist": pred_dist,
+            "pred_normals": torch.nn.functional.normalize(pred_normals, dim=3),
+            "hits_count": hits_count,
+            "frame_time_ms": self.frame_timer.timing() if self.frame_timer is not None else 0.0,
+            "mog_visibility": mog_visibility,
+        }
+
+    def render_dataclass(self, gaussians, gpu_batch: Batch, train=False, frame_id=0, opacity_mask=None):
+        num_gaussians = gaussians.means.shape[0]
+        with torch.cuda.nvtx.range(f"model.forward({num_gaussians} gaussians)"):
+    
+            if self.frame_timer is not None:
+                self.frame_timer.start()
+    
+            opacities = gaussians.opacities*opacity_mask if opacity_mask is not None else gaussians.opacities
+            features_dc = gaussians.features_dc
+            features_rest = gaussians.features_rest.reshape(num_gaussians, -1)
+            features = torch.cat([features_dc, features_rest], dim=1)
+            (pred_rgb, pred_opacity, pred_dist, pred_normals, hits_count, mog_visibility) = Tracer._Autograd.apply(
+                self.tracer_wrapper,
+                frame_id,
+                gpu_batch.T_to_world.contiguous(),
+                gpu_batch.rays_ori.contiguous(),
+                gpu_batch.rays_dir.contiguous(),
+                gaussians.means.contiguous(),
+                gaussians.quats.contiguous(),
+                gaussians.scales.contiguous(),
+                opacities.contiguous(),
+                features.contiguous(),
+                Tracer.RenderOpts.DEFAULT,
+                3, # gaussians.n_active_features, hardcode for now
+                self.conf.render.min_transmittance,
+            )
+
+            if self.frame_timer is not None:
+                self.frame_timer.end()
+
+            # ignore background for now
+            # pred_rgb, pred_opacity = gaussians.background(
+            #     gpu_batch.T_to_world.contiguous(), gpu_batch.rays_dir.contiguous(), pred_rgb, pred_opacity, train
+            # )
+        
         if self.frame_timer is not None:
             self.timings["forward_render"] = self.frame_timer.timing()
 
