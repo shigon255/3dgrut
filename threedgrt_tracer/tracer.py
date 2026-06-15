@@ -250,6 +250,78 @@ class Tracer:
             self.num_update_bvh = 0 if rebuild_bvh else self.num_update_bvh + 1
 
 
+    def build_acc_custom(self, positions, rotations, scales, densities, rebuild=True):
+        """Build the acceleration structure from activated Gaussian tensors."""
+        with torch.cuda.nvtx.range(f"build-bvh-full-build-{rebuild}"):
+            allow_bvh_update = (
+                self.conf.render.max_consecutive_bvh_update > 1
+            ) and not self.conf.render.particle_kernel_density_clamping
+            rebuild_bvh = (
+                rebuild
+                or self.conf.render.particle_kernel_density_clamping
+                or self.num_update_bvh >= self.conf.render.max_consecutive_bvh_update
+            )
+            self.tracer_wrapper.build_bvh(
+                positions.view(-1, 3).contiguous(),
+                rotations.view(-1, 4).contiguous(),
+                scales.view(-1, 3).contiguous(),
+                densities.view(-1, 1).contiguous(),
+                rebuild_bvh,
+                allow_bvh_update,
+            )
+            self.num_update_bvh = 0 if rebuild_bvh else self.num_update_bvh + 1
+
+    def render_custom(
+        self,
+        positions,
+        rotations,
+        scales,
+        densities,
+        features,
+        n_active_features,
+        gpu_batch: Batch,
+        train=False,
+        frame_id=0,
+    ):
+        """Render activated Gaussian tensors without constructing a MixtureOfGaussians."""
+        num_gaussians = positions.shape[0]
+        with torch.cuda.nvtx.range(f"model.forward({num_gaussians} gaussians)"):
+            if self.frame_timer is not None:
+                self.frame_timer.start()
+
+            (pred_rgb, pred_opacity, pred_dist, pred_normals, hits_count, mog_visibility) = Tracer._Autograd.apply(
+                self.tracer_wrapper,
+                frame_id,
+                gpu_batch.T_to_world.contiguous(),
+                gpu_batch.rays_ori.contiguous(),
+                gpu_batch.rays_dir.contiguous(),
+                positions.contiguous(),
+                rotations.contiguous(),
+                scales.contiguous(),
+                densities.contiguous(),
+                features.contiguous(),
+                Tracer.RenderOpts.DEFAULT,
+                n_active_features,
+                self.conf.render.min_transmittance,
+            )
+
+            if self.frame_timer is not None:
+                self.frame_timer.end()
+
+        if self.frame_timer is not None:
+            self.timings["forward_render"] = self.frame_timer.timing()
+
+        return {
+            "pred_rgb": pred_rgb,
+            "pred_opacity": pred_opacity,
+            "pred_dist": pred_dist,
+            "pred_normals": torch.nn.functional.normalize(pred_normals, dim=3),
+            "hits_count": hits_count,
+            "frame_time_ms": self.frame_timer.timing() if self.frame_timer is not None else 0.0,
+            "mog_visibility": mog_visibility,
+        }
+
+
     def render(self, gaussians, gpu_batch: Batch, train=False, frame_id=0):
         num_gaussians = gaussians.num_gaussians
         with torch.cuda.nvtx.range(f"model.forward({num_gaussians} gaussians)"):

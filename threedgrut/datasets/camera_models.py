@@ -86,6 +86,24 @@ class OpenCVPinholeCameraModelParameters(CameraModelParameters, dataclasses_json
 
 
 @dataclass
+class BlenderFisheyeCameraModelParameters(CameraModelParameters, dataclasses_json.DataClassJsonMixin):
+    """Represents Blender lens-polynomial fisheye camera parameters."""
+
+    blender_coeffs: np.ndarray
+    sensor_width_mm: float = 36.0
+    sensor_height_mm: float = 36.0
+    fisheye_fov_deg: float = 180.0
+
+    def __post_init__(self):
+        super().__post_init__()
+        assert self.blender_coeffs.shape == (5,)
+        assert self.blender_coeffs.dtype == np.dtype("float32")
+        assert self.sensor_width_mm > 0.0
+        assert self.sensor_height_mm > 0.0
+        assert self.fisheye_fov_deg > 0.0
+
+
+@dataclass
 class OpenCVFisheyeCameraModelParameters(CameraModelParameters, dataclasses_json.DataClassJsonMixin):
     """Represents Fisheye-specific (OpenCV-like) camera model parameters"""
 
@@ -108,7 +126,7 @@ class OpenCVFisheyeCameraModelParameters(CameraModelParameters, dataclasses_json
         assert self.focal_length.shape == (2,)
         assert self.focal_length.dtype == np.dtype("float32")
         assert self.focal_length[0] > 0.0 and self.focal_length[1] > 0.0
-        assert self.radial_coeffs.shape == (4,)
+        assert self.radial_coeffs.shape == (4,) or self.radial_coeffs.shape == (5,)
         assert self.radial_coeffs.dtype == np.dtype("float32")
         assert self.max_angle > 0.0
 

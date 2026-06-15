@@ -30,6 +30,7 @@ class Batch:
     intrinsics: Optional[list] = None
     intrinsics_OpenCVPinholeCameraModelParameters: Optional[dict] = None
     intrinsics_OpenCVFisheyeCameraModelParameters: Optional[dict] = None
+    intrinsics_BlenderFisheyeCameraModelParameters: Optional[dict] = None
     # Camera/frame indices for post-processing
     camera_idx: int = -1  # 0-based camera index
     frame_idx: int = -1  # 0-based frame index (global across split)
@@ -55,6 +56,18 @@ class Batch:
             assert self.pixel_coords.ndim == 4, "pixel_coords must be a 4D tensor [B, H, W, 2]"
             assert self.pixel_coords.shape[0] == batch_size, "pixel_coords must have the same batch size"
             assert self.pixel_coords.shape[3] == 2, "pixel_coords last dimension must be 2 (x, y)"
+
+
+@dataclass
+class TwoBatch(Batch):
+    T_to_world_last: torch.Tensor = None
+
+    def __post_init__(self):
+        super().__post_init__()
+        assert self.T_to_world_last is not None, "T_to_world_last must be provided"
+        assert self.T_to_world_last.shape[0] == self.T_to_world.shape[0], (
+            "T_to_world_last must have the same batch size"
+        )
 
 
 class BoundedMultiViewDataset(Protocol):

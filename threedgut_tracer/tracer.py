@@ -21,7 +21,7 @@ import numpy as np
 import torch
 from omegaconf import OmegaConf
 
-from threedgrut.datasets.protocols import Batch
+from threedgrut.datasets.protocols import Batch, TwoBatch
 
 logger = logging.getLogger(__name__)
 
@@ -146,6 +146,75 @@ class SensorPose3DModel:
             T_world_sensors=[T_world_sensor_tquat, T_world_sensor_tquat],  # same pose for both timestamps
             timestamps_us=[0, 1],  # arbitrary timestamps
         )
+
+
+class TwoSensorPose3DModel(SensorPose3DModel):
+    def __init__(self, R, T, last_R, last_T, trans=np.array([0.0, 0.0, 0.0]), scale=1.0):
+        super().__init__(R, T, trans, scale)
+        self.last_R = last_R
+        self.last_T = last_T
+        self.world_view_transform_last = (
+            torch.tensor(TwoSensorPose3DModel.__getWorld2View2(last_R, last_T, trans, scale)).transpose(0, 1).cpu()
+        )
+
+    @staticmethod
+    def __getWorld2View2(R, t, translate=np.array([0.0, 0.0, 0.0]), scale=1.0):
+        Rt = np.zeros((4, 4))
+        Rt[:3, :3] = R.transpose()
+        Rt[:3, 3] = t
+        Rt[3, 3] = 1.0
+        C2W = np.linalg.inv(Rt)
+        cam_center = C2W[:3, 3]
+        cam_center = (cam_center + translate) * scale
+        C2W[:3, 3] = cam_center
+        Rt = np.linalg.inv(C2W)
+        return np.float32(Rt)
+
+    @staticmethod
+    def __so3_matrix_to_quat(R: torch.Tensor | np.ndarray, unbatch: bool = True) -> torch.Tensor:
+        if isinstance(R, np.ndarray):
+            R = torch.from_numpy(R)
+
+        R = R.reshape((-1, 3, 3))
+        num_rotations, D1, D2 = R.shape
+        assert (D1, D2) == (3, 3), "so3_matrix_to_quat: Input has to be a Bx3x3 tensor."
+
+        decision_matrix = torch.empty((num_rotations, 4), dtype=R.dtype, device=R.device)
+        quat = torch.empty((num_rotations, 4), dtype=R.dtype, device=R.device)
+        decision_matrix[:, :3] = R.diagonal(dim1=1, dim2=2)
+        decision_matrix[:, -1] = decision_matrix[:, :3].sum(dim=1)
+        choices = decision_matrix.argmax(dim=1)
+
+        ind = torch.nonzero(choices != 3, as_tuple=True)[0]
+        i = choices[ind]
+        j = (i + 1) % 3
+        k = (j + 1) % 3
+        quat[ind, i] = 1 - decision_matrix[ind, -1] + 2 * R[ind, i, i]
+        quat[ind, j] = R[ind, j, i] + R[ind, i, j]
+        quat[ind, k] = R[ind, k, i] + R[ind, i, k]
+        quat[ind, 3] = R[ind, k, j] - R[ind, j, k]
+
+        ind = torch.nonzero(choices == 3, as_tuple=True)[0]
+        quat[ind, 0] = R[ind, 2, 1] - R[ind, 1, 2]
+        quat[ind, 1] = R[ind, 0, 2] - R[ind, 2, 0]
+        quat[ind, 2] = R[ind, 1, 0] - R[ind, 0, 1]
+        quat[ind, 3] = 1 + decision_matrix[ind, -1]
+        quat = quat / torch.norm(quat, dim=1)[:, None]
+        if unbatch:
+            quat = quat.squeeze()
+        return quat
+
+    def get_sensor_pose(self):
+        T_world_sensor_t = self.world_view_transform[3, :3]
+        T_world_sensor_R = self.world_view_transform[:3, :3].transpose(0, 1)
+        T_world_sensor_quat = TwoSensorPose3DModel.__so3_matrix_to_quat(T_world_sensor_R)
+        T_world_sensor_tquat = torch.hstack([T_world_sensor_t.cpu(), T_world_sensor_quat.cpu()])
+
+        T_world_sensor_last_t = self.world_view_transform_last[3, :3]
+        T_world_sensor_last_R = self.world_view_transform_last[:3, :3].transpose(0, 1)
+        T_world_sensor_last_quat = TwoSensorPose3DModel.__so3_matrix_to_quat(T_world_sensor_last_R)
+        T_world_sensor_last_tquat = torch.hstack([T_world_sensor_last_t.cpu(), T_world_sensor_last_quat.cpu()])
+        return SensorPose3D(T_world_sensors=[T_world_sensor_last_tquat, T_world_sensor_tquat], timestamps_us=[0, 1])
 
 
 # ----------------------------------------------------------------------------
@@ -298,6 +367,64 @@ class Tracer:
     def build_acc(self, gaussians, rebuild=True):
         pass  # no-op for 3DGUT
 
+    def build_acc_custom(self, positions, rotations, scales, densities, rebuild=True):
+        pass  # no-op for 3DGUT
+
+    def render_custom(
+        self,
+        positions,
+        rotations,
+        scales,
+        densities,
+        features,
+        n_active_features,
+        gpu_batch: Batch | TwoBatch,
+        train=False,
+        frame_id=0,
+    ):
+        rays_o = gpu_batch.rays_ori
+        rays_d = gpu_batch.rays_dir
+        sensor, poses = Tracer.__create_camera_parameters(gpu_batch)
+
+        num_gaussians = positions.shape[0]
+        with torch.cuda.nvtx.range(f"model.forward({num_gaussians} gaussians)"):
+            (
+                pred_rgba,
+                pred_dist,
+                hits_count,
+                mog_visibility,
+            ) = Tracer._Autograd.apply(
+                self.tracer_wrapper,
+                frame_id,
+                n_active_features,
+                rays_o.contiguous(),
+                rays_d.contiguous(),
+                positions.contiguous(),
+                rotations.contiguous(),
+                scales.contiguous(),
+                densities.contiguous(),
+                features.contiguous(),
+                sensor,
+                poses,
+            )
+
+            pred_rgb = pred_rgba[..., :3].unsqueeze(0).contiguous()
+            pred_opacity = pred_rgba[..., 3:].unsqueeze(0).contiguous()
+            pred_dist = pred_dist.unsqueeze(0).contiguous()
+            hits_count = hits_count.unsqueeze(0).contiguous()
+            timings = self.tracer_wrapper.collect_times()
+
+        return {
+            "pred_rgb": pred_rgb,
+            "pred_opacity": pred_opacity,
+            "pred_dist": pred_dist,
+            "pred_normals": torch.nn.functional.normalize(torch.ones_like(pred_rgb), dim=3),
+            "hits_count": hits_count,
+            "frame_time_ms": timings["forward_render"] if "forward_render" in timings else 0.0,
+            "mog_visibility": mog_visibility,
+        }
+
+
     def render(self, gaussians, gpu_batch: Batch, train=False, frame_id=0):
         rays_o = gpu_batch.rays_ori
         rays_d = gpu_batch.rays_dir
@@ -377,7 +504,18 @@ class Tracer:
         W2C = np.linalg.inv(C2W)
         R = np.transpose(W2C[:3, :3])
         T = W2C[:3, 3]
-        pose_model = SensorPose3DModel(R=R, T=T)
+
+        if isinstance(gpu_batch, TwoBatch):
+            pose_last = gpu_batch.T_to_world_last.squeeze()
+            assert pose_last.ndim == 2
+            C2W_last = np.concatenate((pose_last[:3, :4].cpu().detach().numpy(), np.zeros((1, 4))))
+            C2W_last[3, 3] = 1.0
+            W2C_last = np.linalg.inv(C2W_last)
+            last_R = np.transpose(W2C_last[:3, :3])
+            last_T = W2C_last[:3, 3]
+            pose_model = TwoSensorPose3DModel(R=R, T=T, last_R=last_R, last_T=last_T)
+        else:
+            pose_model = SensorPose3DModel(R=R, T=T)
 
         # Process the camera intrinsics
         if (K := gpu_batch.intrinsics) is not None:
@@ -423,6 +561,24 @@ class Tracer:
             )
             return camera_model_parameters, pose_model.get_sensor_pose()
 
-        raise ValueError(
-            f"Camera intrinsics unavailable or unsupported, input keys are [{', '.join(gpu_batch.keys())}]"
-        )
+        elif (K := gpu_batch.intrinsics_BlenderFisheyeCameraModelParameters) is not None:
+            resolution = K["resolution"]
+            resolution_np = resolution if isinstance(resolution, np.ndarray) else np.array(resolution)
+            principal_point = K.get("principal_point", resolution_np.astype(np.float32) / 2)
+            focal_length = K.get("focal_length", np.array([resolution_np[0], resolution_np[1]], dtype=np.float32))
+            radial_coeffs = K.get("radial_coeffs", np.zeros((4,), dtype=np.float32))
+            radial_coeffs = np.asarray(radial_coeffs, dtype=np.float32)[:4]
+            if radial_coeffs.shape[0] < 4:
+                radial_coeffs = np.pad(radial_coeffs, (0, 4 - radial_coeffs.shape[0]))
+            camera_model_parameters = _3dgut_plugin.fromOpenCVFisheyeCameraModelParameters(
+                resolution=resolution,
+                shutter_type=SHUTTER_TYPE_MAP[K["shutter_type"]],
+                principal_point=principal_point,
+                focal_length=focal_length,
+                radial_coeffs=radial_coeffs,
+                max_angle=K.get("max_angle", float(K.get("fisheye_fov_deg", 180.0)) * math.pi / 180.0 / 2.0),
+            )
+            return camera_model_parameters, pose_model.get_sensor_pose()
+
+        available = [name for name in vars(gpu_batch) if name.startswith("intrinsics") and getattr(gpu_batch, name) is not None]
+        raise ValueError(f"Camera intrinsics unavailable or unsupported, input keys are {available}")
