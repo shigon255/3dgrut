@@ -1,11 +1,34 @@
 import math
+import time
 
 import torch
 
 from .camera import CameraState
-from .camera_models import camera_state_to_batch, mask_batch
+from .camera_models import camera_state_to_batch, slice_batch_flat_indices
 from .effects import RenderEffects, RollingShutterConfig
 from .gaussian_state import GaussianState
+
+
+def _profile_now(device):
+    device = torch.device(device)
+    if device.type == "cuda" and torch.cuda.is_available():
+        torch.cuda.synchronize(device)
+    return time.perf_counter()
+
+
+def _format_profile(prefix, timings):
+    parts = [f"{key}={value * 1000.0:.2f}ms" for key, value in timings.items()]
+    print(f"[render-profile] {prefix}: " + ", ".join(parts), flush=True)
+
+
+def _rolling_flat_indices(axis, chunk_indices, im_w, im_h, device):
+    chunk = torch.as_tensor(chunk_indices, dtype=torch.long, device=device)
+    if axis == "row":
+        flat = chunk[:, None] * im_w + torch.arange(im_w, dtype=torch.long, device=device)[None, :]
+    else:
+        flat = torch.arange(im_h, dtype=torch.long, device=device)[:, None] * im_w + chunk[None, :]
+    # Boolean masking returned pixels in ascending flat image order; preserve that ordering.
+    return torch.sort(flat.reshape(-1)).values
 
 
 def create_tracer(mode, config):
@@ -30,12 +53,22 @@ def render_gaussian_state(
 ):
     gaussians.validate()
     effects = RenderEffects() if effects is None else effects
+    profile = bool(getattr(effects, "profile", False))
+    device = gaussians.positions.device
+    timings = {}
+    start = _profile_now(device) if profile else None
+
     batch = camera_state_to_batch(
         camera,
         effects,
-        device=gaussians.positions.device,
+        device=device,
         use_rolling_shutter=False,
     )
+    if profile:
+        now = _profile_now(device)
+        timings["batch"] = now - start
+        start = now
+
     tracer.build_acc_custom(
         positions=gaussians.positions,
         rotations=gaussians.rotations,
@@ -43,6 +76,11 @@ def render_gaussian_state(
         densities=gaussians.densities,
         rebuild=rebuild,
     )
+    if profile:
+        now = _profile_now(device)
+        timings["build"] = now - start
+        start = now
+
     render_pkg = tracer.render_custom(
         positions=gaussians.positions,
         rotations=gaussians.rotations,
@@ -52,7 +90,16 @@ def render_gaussian_state(
         n_active_features=gaussians.active_sh_degree,
         gpu_batch=batch,
     )
-    return _format_render_pkg(render_pkg, gaussians.positions, bg_color)
+    if profile:
+        now = _profile_now(device)
+        timings["trace"] = now - start
+        start = now
+
+    result = _format_render_pkg(render_pkg, gaussians.positions, bg_color)
+    if profile:
+        timings["format"] = _profile_now(device) - start
+        _format_profile("global", timings)
+    return result
 
 
 def render_rolling_shutter(
@@ -63,6 +110,7 @@ def render_rolling_shutter(
     rolling_cfg: RollingShutterConfig,
     bg_color: torch.Tensor | None = None,
     rebuild=True,
+    states_at_times=None,
 ):
     if camera.time is None:
         raise ValueError("camera.time is required for rolling-shutter rendering.")
@@ -94,6 +142,10 @@ def render_rolling_shutter(
     rgb_buffer = None
     depth_buffer = None
     opacity_buffer = None
+    base_batch = None
+    flat_index_chunks = None
+    timings = {"state": 0.0, "batch": 0.0, "build": 0.0, "trace": 0.0}
+    profile = bool(getattr(effects, "profile", False))
     axis = "row" if rolling_cfg.shutter_type in ("rolling_tb", "rolling_bt") else "col"
     if axis == "row":
         indices = [y if rolling_cfg.shutter_type == "rolling_tb" else im_h - y - 1 for y in range(im_h)]
@@ -102,36 +154,83 @@ def render_rolling_shutter(
 
     row_chunk_size = int(rolling_cfg.row_chunk_size)
     rebuild_every = int(rolling_cfg.rebuild_every)
-    if row_chunk_size <= 0 or rebuild_every <= 0:
-        raise ValueError("row_chunk_size and rebuild_every must be positive.")
+    state_batch_size = int(getattr(rolling_cfg, "state_batch_size", 1))
+    if row_chunk_size <= 0 or rebuild_every <= 0 or state_batch_size <= 0:
+        raise ValueError("row_chunk_size, rebuild_every, and state_batch_size must be positive.")
 
-    for idx in range(0, len(indices), row_chunk_size):
-        chunk_indices = indices[idx : idx + row_chunk_size]
-        if len(chunk_indices) != row_chunk_size:
-            continue
+    total_chunks = len(indices) // row_chunk_size
+    progress_interval = max(1, total_chunks // 20)
+    print(
+        f"[rolling-shutter] start image: shutter={rolling_cfg.shutter_type}, "
+        f"axis={axis}, resolution={im_w}x{im_h}, chunks={total_chunks}, "
+        f"chunk_size={row_chunk_size}, rebuild_every={rebuild_every}, "
+        f"state_batch_size={state_batch_size}",
+        flush=True,
+    )
+
+    state_queue = {}
+
+    def chunk_time(offset, chunk_indices):
         if row_chunk_size > 1:
             times = [
                 row_time(chunk_idx if axis == "col" else 0, chunk_idx if axis == "row" else 0)
                 for chunk_idx in chunk_indices
             ]
-            time_value = sum(times) / row_chunk_size
+            value = sum(times) / row_chunk_size
         else:
-            time_value = row_time(idx if axis == "col" else 0, idx if axis == "row" else 0)
-        time_value = max(prev_time, min(float(time_value), next_time))
-        state = state_at_time(time_value).validate()
+            value = row_time(offset if axis == "col" else 0, offset if axis == "row" else 0)
+        return max(prev_time, min(float(value), next_time))
+
+    for idx in range(0, len(indices), row_chunk_size):
+        chunk_indices = indices[idx : idx + row_chunk_size]
+        if len(chunk_indices) != row_chunk_size:
+            continue
+        chunk_number = idx // row_chunk_size + 1
+        if chunk_number == 1 or chunk_number == total_chunks or chunk_number % progress_interval == 0:
+            print(
+                f"[rolling-shutter] {axis} chunk {chunk_number}/{total_chunks} "
+                f"({100.0 * chunk_number / total_chunks:.1f}%)",
+                flush=True,
+            )
+        time_value = chunk_time(idx, chunk_indices)
+        start = _profile_now("cuda") if profile and torch.cuda.is_available() else (time.perf_counter() if profile else None)
+        if states_at_times is not None and state_batch_size > 1:
+            if chunk_number not in state_queue:
+                group_offsets = list(range(idx, min(len(indices), idx + row_chunk_size * state_batch_size), row_chunk_size))
+                group_records = []
+                group_times = []
+                for group_offset in group_offsets:
+                    group_indices = indices[group_offset : group_offset + row_chunk_size]
+                    if len(group_indices) != row_chunk_size:
+                        continue
+                    group_number = group_offset // row_chunk_size + 1
+                    group_records.append(group_number)
+                    group_times.append(chunk_time(group_offset, group_indices))
+                for group_number, group_state in zip(group_records, states_at_times(group_times)):
+                    state_queue[group_number] = group_state
+            state = state_queue.pop(chunk_number).validate()
+        else:
+            state = state_at_time(time_value).validate()
+        if profile:
+            now = _profile_now(state.positions.device)
+            timings["state"] += now - start
+            start = now
         if rgb_buffer is None:
             rgb_buffer = torch.zeros((im_h, im_w, 3), dtype=torch.float32, device=state.positions.device)
             depth_buffer = torch.zeros((im_h, im_w, 1), dtype=torch.float32, device=state.positions.device)
             opacity_buffer = torch.zeros((im_h, im_w, 1), dtype=torch.float32, device=state.positions.device)
+            base_batch = camera_state_to_batch(camera, effects, device=state.positions.device)
+            flat_index_chunks = [
+                _rolling_flat_indices(axis, indices[offset : offset + row_chunk_size], im_w, im_h, state.positions.device)
+                for offset in range(0, len(indices), row_chunk_size)
+                if len(indices[offset : offset + row_chunk_size]) == row_chunk_size
+            ]
 
-        batch = camera_state_to_batch(camera, effects, device=state.positions.device)
-        row_mask = torch.zeros((im_h, im_w), dtype=torch.bool, device=state.positions.device)
-        for chunk_idx in chunk_indices:
-            if axis == "row":
-                row_mask[chunk_idx, :] = True
-            else:
-                row_mask[:, chunk_idx] = True
-        batch = mask_batch(batch, row_mask, make_square=True)
+        batch = slice_batch_flat_indices(batch=base_batch, flat_indices=flat_index_chunks[chunk_number - 1], make_square=True)
+        if profile:
+            now = _profile_now(state.positions.device)
+            timings["batch"] += now - start
+            start = now
 
         tracer.build_acc_custom(
             positions=state.positions,
@@ -140,6 +239,10 @@ def render_rolling_shutter(
             densities=state.densities,
             rebuild=(idx % rebuild_every == 0) or rebuild,
         )
+        if profile:
+            now = _profile_now(state.positions.device)
+            timings["build"] += now - start
+            start = now
         row_pkg = tracer.render_custom(
             positions=state.positions,
             rotations=state.rotations,
@@ -149,10 +252,26 @@ def render_rolling_shutter(
             n_active_features=state.active_sh_degree,
             gpu_batch=batch,
         )
+        if profile:
+            timings["trace"] += _profile_now(state.positions.device) - start
         batch_size = row_pkg["pred_rgb"].shape[0]
-        row_rgb = row_pkg["pred_rgb"].reshape(batch_size, row_chunk_size, -1, 3).mean(0)
-        row_depth = row_pkg["pred_dist"].reshape(batch_size, row_chunk_size, -1, 1).mean(0)
-        row_opacity = row_pkg["pred_opacity"].reshape(batch_size, row_chunk_size, -1, 1).mean(0)
+        expected_pixels = row_chunk_size * (im_w if axis == "row" else im_h)
+
+        def crop_padded_chunk(tensor, channels):
+            flattened = tensor.reshape(batch_size, -1, channels)
+            if flattened.shape[1] < expected_pixels:
+                raise RuntimeError(
+                    f"Rolling-shutter render returned {flattened.shape[1]} pixels, "
+                    f"expected at least {expected_pixels}."
+                )
+            averaged = flattened[:, :expected_pixels, :].mean(0)
+            if axis == "row":
+                return averaged.reshape(row_chunk_size, im_w, channels)
+            return averaged.reshape(im_h, row_chunk_size, channels)
+
+        row_rgb = crop_padded_chunk(row_pkg["pred_rgb"], 3)
+        row_depth = crop_padded_chunk(row_pkg["pred_dist"], 1)
+        row_opacity = crop_padded_chunk(row_pkg["pred_opacity"], 1)
         start = idx
         end = idx + row_chunk_size
         if axis == "row":
@@ -163,6 +282,10 @@ def render_rolling_shutter(
             rgb_buffer[:, start:end] = row_rgb
             depth_buffer[:, start:end] = row_depth
             opacity_buffer[:, start:end] = row_opacity
+
+    print("[rolling-shutter] finished image", flush=True)
+    if profile:
+        _format_profile("rolling-shutter", timings)
 
     pred_rgb = rgb_buffer.permute(2, 0, 1)
     pred_depth = depth_buffer.permute(2, 0, 1)

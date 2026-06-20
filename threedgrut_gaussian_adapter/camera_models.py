@@ -14,6 +14,11 @@ except ImportError:
 from threedgrut.datasets.protocols import Batch, TwoBatch
 from threedgrut.datasets.utils import compute_max_radius
 try:
+    from threedgrut_playground.utils.rng import rng_torch_low_discrepancy
+except ImportError:
+    rng_torch_low_discrepancy = None
+
+try:
     from threedgrut_playground.utils.depth_of_field import RayBundle
 except ImportError:
     class RayBundle:
@@ -35,6 +40,9 @@ SHUTTER_TYPE_MAP = {
     "rolling_lr": ShutterType.ROLLING_LEFT_TO_RIGHT,
     "rolling_rl": ShutterType.ROLLING_RIGHT_TO_LEFT,
 }
+
+_CAMERA_TEMPLATE_CACHE = {}
+_MAX_CAMERA_TEMPLATE_CACHE_SIZE = 16
 
 
 def fov2focal(fov, pixels):
@@ -270,15 +278,161 @@ def create_blender_fisheye_camera(
     )
 
 
+def _normalize_device(device):
+    return str(torch.device(device))
+
+
+def _float_key(value):
+    return None if value is None else float(value)
+
+
+def _sequence_key(values):
+    if values is None:
+        return None
+    return tuple(float(v) for v in values)
+
+
+def _camera_template_key(camera: CameraState, effects: RenderEffects, device):
+    return (
+        int(camera.width),
+        int(camera.height),
+        float(camera.fovx),
+        float(camera.fovy),
+        effects.trace_camera_type,
+        _sequence_key(effects.radial_coeffs),
+        _float_key(effects.fisheye_fov_deg),
+        _float_key(effects.sensor_width_mm),
+        _float_key(effects.sensor_height_mm),
+        effects.shutter_type,
+        _normalize_device(device),
+    )
+
+
+def _cache_put(key, value):
+    if len(_CAMERA_TEMPLATE_CACHE) >= _MAX_CAMERA_TEMPLATE_CACHE_SIZE:
+        _CAMERA_TEMPLATE_CACHE.pop(next(iter(_CAMERA_TEMPLATE_CACHE)))
+    _CAMERA_TEMPLATE_CACHE[key] = value
+
+
+def get_camera_template(camera: CameraState, effects: RenderEffects, device="cuda:0", use_cache=True):
+    camera.validate()
+    key = _camera_template_key(camera, effects, device)
+    if use_cache and key in _CAMERA_TEMPLATE_CACHE:
+        return _CAMERA_TEMPLATE_CACHE[key]
+
+    focalx = fov2focal(camera.fovx, camera.width)
+    focaly = fov2focal(camera.fovy, camera.height)
+    shutter_type = SHUTTER_TYPE_MAP.get(effects.shutter_type, ShutterType.GLOBAL)
+    radial_coeffs = effects.radial_coeffs
+
+    if effects.trace_camera_type == "pinhole":
+        template = create_pinhole_camera(
+            focalx, focaly, camera.width, camera.height, shutter_type=shutter_type
+        )
+    elif effects.trace_camera_type == "fisheye":
+        template = create_fisheye_camera(
+            focalx,
+            focaly,
+            camera.width,
+            camera.height,
+            radial_coeffs=radial_coeffs,
+            fisheye_fov=effects.fisheye_fov_deg,
+            sensor_width_mm=effects.sensor_width_mm,
+            sensor_height_mm=effects.sensor_height_mm,
+            shutter_type=shutter_type,
+        )
+    elif effects.trace_camera_type == "blender_fisheye":
+        template = create_blender_fisheye_camera(
+            camera.width,
+            camera.height,
+            blender_coeffs=radial_coeffs,
+            sensor_width_mm=effects.sensor_width_mm,
+            sensor_height_mm=effects.sensor_height_mm,
+            fisheye_fov_deg=effects.fisheye_fov_deg,
+            shutter_type=shutter_type,
+        )
+    else:
+        raise ValueError(f"Unsupported trace camera type: {effects.trace_camera_type}")
+
+    cam_param_dict, rays_o, rays_d, cam_param_name, pixel_x, pixel_y = template
+    cached_template = (
+        cam_param_dict,
+        rays_o.to(device=device, non_blocking=True),
+        rays_d.to(device=device, non_blocking=True),
+        cam_param_name,
+        pixel_x.to(device=device, non_blocking=True),
+        pixel_y.to(device=device, non_blocking=True),
+    )
+    if use_cache:
+        _cache_put(key, cached_template)
+    return cached_template
+
+
+def _pixel_to_disc_shirley(seed):
+    a = 2.0 * seed[:, 0] - 1.0
+    b = 2.0 * seed[:, 1] - 1.0
+    mask = a * a > b * b
+    pi = torch.pi
+    r = torch.where(mask, a, b)
+    phi = torch.where(mask, (pi / 4.0) * (b / a), (pi / 4.0) * (a / b) + (pi / 2.0))
+    return torch.stack((r * torch.cos(phi), r * torch.sin(phi)))
+
+
+def _dof_inner(dof):
+    return getattr(dof, "dof", dof)
+
+
+def _generate_dof_rays_vectorized(camera_R, rays, dof):
+    if rng_torch_low_discrepancy is None:
+        return None
+    depth_of_field = _dof_inner(dof)
+    if getattr(depth_of_field, "RNG_MODE", None) != "low_discrepancy_seq":
+        return None
+
+    h, w = rays.pixel_x.shape
+    spp = int(dof.get_spp() if hasattr(dof, "get_spp") else depth_of_field.spp)
+    ray_count = h * w
+    focus_z = float(getattr(dof, "current_focus_z", getattr(depth_of_field, "focus_z")))
+    aperture_size = float(getattr(dof, "current_aperture_size", getattr(depth_of_field, "aperture_size")))
+
+    rays_ori = rays.rays_ori
+    rays_dir = rays.rays_dir
+    device = rays_ori.device
+    camera_R = camera_R.to(device=device, dtype=torch.float32)
+    base_seed = (rays.pixel_x.long() * 19349663 + rays.pixel_y.long() * 96925573).reshape(ray_count) & 0xFFFFFFFF
+    sample_index = torch.arange(1, spp + 1, device=device, dtype=torch.long).reshape(spp, 1).expand(spp, ray_count)
+    seed = base_seed.reshape(1, ray_count).expand(spp, ray_count).reshape(-1)
+    seed = rng_torch_low_discrepancy(sample_index.reshape(-1), seed)
+    seed = torch.stack(seed, dim=1)
+
+    blur = aperture_size * _pixel_to_disc_shirley(seed)
+    expanded_cam = camera_R[:3, :2][None].expand(spp * ray_count, 3, 2)
+    base_ori = rays_ori.expand(spp, h, w, 3).reshape(spp * ray_count, 3)
+    lookat = (rays_ori + rays_dir * focus_z).expand(spp, h, w, 3).reshape(spp * ray_count, 3)
+    rays_ori = base_ori + (expanded_cam @ blur.T[:, :, None]).reshape_as(base_ori)
+    rays_dir = (lookat - rays_ori) / focus_z
+
+    if hasattr(depth_of_field, "spp_accumulated_for_frame"):
+        depth_of_field.spp_accumulated_for_frame = spp + 1
+    return rays_ori.reshape(spp, h, w, 3), rays_dir.reshape(spp, h, w, 3)
+
+
 def generate_dof_rays(camera_R, rays, dof):
     if dof is None:
         raise ValueError("Depth of field parameters must be provided.")
     h, w = rays.pixel_x.shape
     b = dof.get_spp()
     output_shape = (b, h, w, 3)
+    dof.reset_accumulation()
+    vectorized = _generate_dof_rays_vectorized(camera_R, rays, dof)
+    if vectorized is not None:
+        dof_rays_o, dof_rays_d = vectorized
+        if dof_rays_o.shape != output_shape or dof_rays_d.shape != output_shape:
+            raise ValueError(f"Unexpected DOF ray shape: {dof_rays_o.shape}, {dof_rays_d.shape}; expected {output_shape}.")
+        return dof_rays_o, dof_rays_d
+
     dof_rays_o = []
     dof_rays_d = []
-    dof.reset_accumulation()
     while dof.has_more_to_accumulate():
         rays_o, rays_d = dof(camera_R, rays)
         dof_rays_o.append(rays_o)
@@ -291,53 +445,22 @@ def generate_dof_rays(camera_R, rays, dof):
 
 
 def camera_state_to_batch(camera: CameraState, effects: RenderEffects, device="cuda:0", use_rolling_shutter=False):
-    camera.validate()
-    focalx = fov2focal(camera.fovx, camera.width)
-    focaly = fov2focal(camera.fovy, camera.height)
-    shutter_type = SHUTTER_TYPE_MAP.get(effects.shutter_type, ShutterType.GLOBAL)
-    radial_coeffs = effects.radial_coeffs
-
-    if effects.trace_camera_type == "pinhole":
-        cam_param_dict, rays_o, rays_d, cam_param_name, pixel_x, pixel_y = create_pinhole_camera(
-            focalx, focaly, camera.width, camera.height, shutter_type=shutter_type
-        )
-    elif effects.trace_camera_type == "fisheye":
-        cam_param_dict, rays_o, rays_d, cam_param_name, pixel_x, pixel_y = create_fisheye_camera(
-            focalx,
-            focaly,
-            camera.width,
-            camera.height,
-            radial_coeffs=radial_coeffs,
-            fisheye_fov=effects.fisheye_fov_deg,
-            sensor_width_mm=effects.sensor_width_mm,
-            sensor_height_mm=effects.sensor_height_mm,
-            shutter_type=shutter_type,
-        )
-    elif effects.trace_camera_type == "blender_fisheye":
-        cam_param_dict, rays_o, rays_d, cam_param_name, pixel_x, pixel_y = create_blender_fisheye_camera(
-            camera.width,
-            camera.height,
-            blender_coeffs=radial_coeffs,
-            sensor_width_mm=effects.sensor_width_mm,
-            sensor_height_mm=effects.sensor_height_mm,
-            fisheye_fov_deg=effects.fisheye_fov_deg,
-            shutter_type=shutter_type,
-        )
-    else:
-        raise ValueError(f"Unsupported trace camera type: {effects.trace_camera_type}")
+    cam_param_dict, rays_o, rays_d, cam_param_name, pixel_x, pixel_y = get_camera_template(
+        camera, effects, device=device, use_cache=effects.cache_camera_batches
+    )
 
     batch_size = effects.dof.get_spp() if effects.dof is not None else 1
-    c2w = camera.c2w.to(dtype=torch.float32).reshape(1, 4, 4).expand(batch_size, 4, 4)
+    c2w = camera.c2w.to(dtype=torch.float32, device=device).reshape(1, 4, 4).expand(batch_size, 4, 4)
     if effects.dof is not None:
         rays = RayBundle(
-            rays_o=rays_o.clone(),
-            rays_d=rays_d.clone(),
+            rays_o=rays_o,
+            rays_d=rays_d,
             pixel_x=pixel_x,
             pixel_y=pixel_y,
         )
-        rays_o, rays_d = generate_dof_rays(torch.eye(3, dtype=torch.float32), rays, effects.dof)
+        rays_o, rays_d = generate_dof_rays(torch.eye(3, dtype=torch.float32, device=rays_o.device), rays, effects.dof)
 
-    rgb_gt = torch.zeros((batch_size, camera.height, camera.width, 3), dtype=torch.float32)
+    rgb_gt = torch.zeros((batch_size, camera.height, camera.width, 3), dtype=torch.float32, device=device)
     if camera.image is not None:
         rgb_gt = camera.image.reshape(1, 3, camera.height, camera.width).permute(0, 2, 3, 1)
         rgb_gt = rgb_gt.expand(batch_size, camera.height, camera.width, 3)
@@ -346,9 +469,9 @@ def camera_state_to_batch(camera: CameraState, effects: RenderEffects, device="c
         mask = camera.mask.reshape(1, camera.height, camera.width, 1).expand(batch_size, camera.height, camera.width, 1)
 
     sample = {
-        "rays_ori": rays_o.to(device=device, non_blocking=True),
-        "rays_dir": rays_d.to(device=device, non_blocking=True),
-        "T_to_world": c2w.to(device=device, non_blocking=True),
+        "rays_ori": rays_o,
+        "rays_dir": rays_d,
+        "T_to_world": c2w,
         "rgb_gt": rgb_gt.to(device=device, non_blocking=True),
         "mask": mask.to(device=device, non_blocking=True) if mask is not None else None,
         f"intrinsics_{cam_param_name}": cam_param_dict,
@@ -359,6 +482,37 @@ def camera_state_to_batch(camera: CameraState, effects: RenderEffects, device="c
         sample["T_to_world_last"] = camera.last_c2w.to(dtype=torch.float32).reshape(1, 4, 4).expand(batch_size, 4, 4).to(device=device)
         return TwoBatch(**sample)
     return Batch(**sample)
+
+
+def slice_batch_flat_indices(batch: Batch, flat_indices: torch.Tensor, make_square=False) -> Batch:
+    b, h, w, _ = batch.rays_ori.shape
+    flat_indices = flat_indices.to(device=batch.rays_ori.device, dtype=torch.long)
+    rays_ori = batch.rays_ori.reshape(b, h * w, 3).index_select(1, flat_indices)
+    rays_dir = batch.rays_dir.reshape(b, h * w, 3).index_select(1, flat_indices)
+    if make_square:
+        n = rays_ori.shape[1]
+        side = int(np.ceil(np.sqrt(n)))
+        padded_n = side * side
+        if padded_n > n:
+            pad = padded_n - n
+            rays_ori = torch.cat([rays_ori, torch.zeros((b, pad, 3), dtype=rays_ori.dtype, device=rays_ori.device)], dim=1)
+            rays_dir = torch.cat([rays_dir, torch.zeros((b, pad, 3), dtype=rays_dir.dtype, device=rays_dir.device)], dim=1)
+        rays_ori = rays_ori.reshape(b, side, side, 3)
+        rays_dir = rays_dir.reshape(b, side, side, 3)
+    else:
+        rays_ori = rays_ori.reshape(b, 1, -1, 3)
+        rays_dir = rays_dir.reshape(b, 1, -1, 3)
+    return Batch(
+        rays_ori=rays_ori,
+        rays_dir=rays_dir,
+        T_to_world=batch.T_to_world,
+        rgb_gt=None,
+        mask=None,
+        intrinsics=batch.intrinsics,
+        intrinsics_OpenCVPinholeCameraModelParameters=batch.intrinsics_OpenCVPinholeCameraModelParameters,
+        intrinsics_OpenCVFisheyeCameraModelParameters=batch.intrinsics_OpenCVFisheyeCameraModelParameters,
+        intrinsics_BlenderFisheyeCameraModelParameters=batch.intrinsics_BlenderFisheyeCameraModelParameters,
+    )
 
 
 def mask_batch(batch: Batch, mask: torch.Tensor, make_square=False) -> Batch:

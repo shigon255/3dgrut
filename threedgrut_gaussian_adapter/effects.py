@@ -15,6 +15,7 @@ class RollingShutterConfig:
     maxtime: float = 1.0
     row_chunk_size: int = 1
     rebuild_every: int = 128
+    state_batch_size: int = 1
 
 
 @dataclass
@@ -27,3 +28,5 @@ class RenderEffects:
     dof: Optional[object] = None
     shutter_type: str = "global"
     rolling_shutter: Optional[RollingShutterConfig] = None
+    cache_camera_batches: bool = True
+    profile: bool = False
