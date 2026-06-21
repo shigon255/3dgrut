@@ -17,6 +17,7 @@ class CameraState:
     mask: Optional[torch.Tensor] = None
     time: Optional[float] = None
     last_c2w: Optional[torch.Tensor] = None
+    last_time: Optional[float] = None
 
     def validate(self):
         if self.width <= 0 or self.height <= 0:

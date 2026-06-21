@@ -382,7 +382,7 @@ def _dof_inner(dof):
     return getattr(dof, "dof", dof)
 
 
-def _generate_dof_rays_vectorized(camera_R, rays, dof):
+def _generate_dof_rays_vectorized(camera_R, rays, dof, sample_start=1, sample_count=None):
     if rng_torch_low_discrepancy is None:
         return None
     depth_of_field = _dof_inner(dof)
@@ -390,7 +390,8 @@ def _generate_dof_rays_vectorized(camera_R, rays, dof):
         return None
 
     h, w = rays.pixel_x.shape
-    spp = int(dof.get_spp() if hasattr(dof, "get_spp") else depth_of_field.spp)
+    total_spp = int(dof.get_spp() if hasattr(dof, "get_spp") else depth_of_field.spp)
+    spp = total_spp if sample_count is None else int(sample_count)
     ray_count = h * w
     focus_z = float(getattr(dof, "current_focus_z", getattr(depth_of_field, "focus_z")))
     aperture_size = float(getattr(dof, "current_aperture_size", getattr(depth_of_field, "aperture_size")))
@@ -400,7 +401,7 @@ def _generate_dof_rays_vectorized(camera_R, rays, dof):
     device = rays_ori.device
     camera_R = camera_R.to(device=device, dtype=torch.float32)
     base_seed = (rays.pixel_x.long() * 19349663 + rays.pixel_y.long() * 96925573).reshape(ray_count) & 0xFFFFFFFF
-    sample_index = torch.arange(1, spp + 1, device=device, dtype=torch.long).reshape(spp, 1).expand(spp, ray_count)
+    sample_index = torch.arange(sample_start, sample_start + spp, device=device, dtype=torch.long).reshape(spp, 1).expand(spp, ray_count)
     seed = base_seed.reshape(1, ray_count).expand(spp, ray_count).reshape(-1)
     seed = rng_torch_low_discrepancy(sample_index.reshape(-1), seed)
     seed = torch.stack(seed, dim=1)
@@ -413,18 +414,19 @@ def _generate_dof_rays_vectorized(camera_R, rays, dof):
     rays_dir = (lookat - rays_ori) / focus_z
 
     if hasattr(depth_of_field, "spp_accumulated_for_frame"):
-        depth_of_field.spp_accumulated_for_frame = spp + 1
+        depth_of_field.spp_accumulated_for_frame = sample_start + spp
     return rays_ori.reshape(spp, h, w, 3), rays_dir.reshape(spp, h, w, 3)
 
 
-def generate_dof_rays(camera_R, rays, dof):
+def generate_dof_rays(camera_R, rays, dof, sample_start=1, sample_count=None):
     if dof is None:
         raise ValueError("Depth of field parameters must be provided.")
     h, w = rays.pixel_x.shape
-    b = dof.get_spp()
+    total_spp = dof.get_spp()
+    b = total_spp if sample_count is None else int(sample_count)
     output_shape = (b, h, w, 3)
     dof.reset_accumulation()
-    vectorized = _generate_dof_rays_vectorized(camera_R, rays, dof)
+    vectorized = _generate_dof_rays_vectorized(camera_R, rays, dof, sample_start=sample_start, sample_count=b)
     if vectorized is not None:
         dof_rays_o, dof_rays_d = vectorized
         if dof_rays_o.shape != output_shape or dof_rays_d.shape != output_shape:
@@ -444,12 +446,12 @@ def generate_dof_rays(camera_R, rays, dof):
     return dof_rays_o, dof_rays_d
 
 
-def camera_state_to_batch(camera: CameraState, effects: RenderEffects, device="cuda:0", use_rolling_shutter=False):
+def camera_state_to_batch(camera: CameraState, effects: RenderEffects, device="cuda:0", use_rolling_shutter=False, dof_sample_start=1, dof_sample_count=None):
     cam_param_dict, rays_o, rays_d, cam_param_name, pixel_x, pixel_y = get_camera_template(
         camera, effects, device=device, use_cache=effects.cache_camera_batches
     )
 
-    batch_size = effects.dof.get_spp() if effects.dof is not None else 1
+    batch_size = (effects.dof.get_spp() if dof_sample_count is None else int(dof_sample_count)) if effects.dof is not None else 1
     c2w = camera.c2w.to(dtype=torch.float32, device=device).reshape(1, 4, 4).expand(batch_size, 4, 4)
     if effects.dof is not None:
         rays = RayBundle(
@@ -458,7 +460,13 @@ def camera_state_to_batch(camera: CameraState, effects: RenderEffects, device="c
             pixel_x=pixel_x,
             pixel_y=pixel_y,
         )
-        rays_o, rays_d = generate_dof_rays(torch.eye(3, dtype=torch.float32, device=rays_o.device), rays, effects.dof)
+        rays_o, rays_d = generate_dof_rays(
+            torch.eye(3, dtype=torch.float32, device=rays_o.device),
+            rays,
+            effects.dof,
+            sample_start=dof_sample_start,
+            sample_count=batch_size,
+        )
 
     rgb_gt = torch.zeros((batch_size, camera.height, camera.width, 3), dtype=torch.float32, device=device)
     if camera.image is not None:

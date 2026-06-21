@@ -21,6 +21,10 @@ def _format_profile(prefix, timings):
     print(f"[render-profile] {prefix}: " + ", ".join(parts), flush=True)
 
 
+_ROLLING_INDEX_CHUNKS_CACHE = {}
+_MAX_ROLLING_INDEX_CHUNKS_CACHE_SIZE = 16
+
+
 def _rolling_flat_indices(axis, chunk_indices, im_w, im_h, device):
     chunk = torch.as_tensor(chunk_indices, dtype=torch.long, device=device)
     if axis == "row":
@@ -29,6 +33,133 @@ def _rolling_flat_indices(axis, chunk_indices, im_w, im_h, device):
         flat = torch.arange(im_h, dtype=torch.long, device=device)[:, None] * im_w + chunk[None, :]
     # Boolean masking returned pixels in ascending flat image order; preserve that ordering.
     return torch.sort(flat.reshape(-1)).values
+
+
+def _rolling_flat_index_chunks(axis, indices, row_chunk_size, im_w, im_h, device):
+    device_key = str(torch.device(device))
+    key = (axis, tuple(indices), int(row_chunk_size), int(im_w), int(im_h), device_key)
+    cached = _ROLLING_INDEX_CHUNKS_CACHE.get(key)
+    if cached is not None:
+        return cached
+    chunks = [
+        _rolling_flat_indices(axis, indices[offset : offset + row_chunk_size], im_w, im_h, device)
+        for offset in range(0, len(indices), row_chunk_size)
+        if len(indices[offset : offset + row_chunk_size]) == row_chunk_size
+    ]
+    if len(_ROLLING_INDEX_CHUNKS_CACHE) >= _MAX_ROLLING_INDEX_CHUNKS_CACHE_SIZE:
+        _ROLLING_INDEX_CHUNKS_CACHE.pop(next(iter(_ROLLING_INDEX_CHUNKS_CACHE)))
+    _ROLLING_INDEX_CHUNKS_CACHE[key] = chunks
+    return chunks
+
+
+def _normalize_quaternion(q):
+    return q / torch.clamp(torch.linalg.norm(q, dim=-1, keepdim=True), min=1e-8)
+
+
+def _matrix_to_quaternion(matrix):
+    m = matrix
+    q_abs = torch.sqrt(torch.clamp(
+        torch.stack([
+            1.0 + m[..., 0, 0] + m[..., 1, 1] + m[..., 2, 2],
+            1.0 + m[..., 0, 0] - m[..., 1, 1] - m[..., 2, 2],
+            1.0 - m[..., 0, 0] + m[..., 1, 1] - m[..., 2, 2],
+            1.0 - m[..., 0, 0] - m[..., 1, 1] + m[..., 2, 2],
+        ], dim=-1),
+        min=0.0,
+    ))
+    quat_by_rijk = torch.stack([
+        torch.stack([q_abs[..., 0] ** 2, m[..., 2, 1] - m[..., 1, 2], m[..., 0, 2] - m[..., 2, 0], m[..., 1, 0] - m[..., 0, 1]], dim=-1),
+        torch.stack([m[..., 2, 1] - m[..., 1, 2], q_abs[..., 1] ** 2, m[..., 1, 0] + m[..., 0, 1], m[..., 0, 2] + m[..., 2, 0]], dim=-1),
+        torch.stack([m[..., 0, 2] - m[..., 2, 0], m[..., 1, 0] + m[..., 0, 1], q_abs[..., 2] ** 2, m[..., 2, 1] + m[..., 1, 2]], dim=-1),
+        torch.stack([m[..., 1, 0] - m[..., 0, 1], m[..., 2, 0] + m[..., 0, 2], m[..., 2, 1] + m[..., 1, 2], q_abs[..., 3] ** 2], dim=-1),
+    ], dim=-2)
+    denom = torch.clamp(2.0 * q_abs[..., None], min=0.1)
+    candidates = quat_by_rijk / denom
+    return _normalize_quaternion(candidates[torch.argmax(q_abs, dim=-1)])
+
+
+def _quaternion_to_matrix(quaternion):
+    q = _normalize_quaternion(quaternion)
+    r, i, j, k = q.unbind(-1)
+    two_s = 2.0
+    return torch.stack([
+        1.0 - two_s * (j * j + k * k), two_s * (i * j - k * r), two_s * (i * k + j * r),
+        two_s * (i * j + k * r), 1.0 - two_s * (i * i + k * k), two_s * (j * k - i * r),
+        two_s * (i * k - j * r), two_s * (j * k + i * r), 1.0 - two_s * (i * i + j * j),
+    ], dim=-1).reshape(q.shape[:-1] + (3, 3))
+
+
+def _slerp_quaternion(q0, q1, t):
+    q0 = _normalize_quaternion(q0)
+    q1 = _normalize_quaternion(q1)
+    dot = torch.sum(q0 * q1, dim=-1, keepdim=True)
+    q1 = torch.where(dot < 0.0, -q1, q1)
+    dot = torch.abs(dot).clamp(-1.0, 1.0)
+    if float(dot.item()) > 0.9995:
+        return _normalize_quaternion((1.0 - t) * q0 + t * q1)
+    theta_0 = torch.acos(dot)
+    sin_theta_0 = torch.sin(theta_0)
+    theta = theta_0 * t
+    s0 = torch.sin(theta_0 - theta) / sin_theta_0
+    s1 = torch.sin(theta) / sin_theta_0
+    return _normalize_quaternion(s0 * q0 + s1 * q1)
+
+
+def _interpolate_c2w(start_c2w, end_c2w, t):
+    if t <= 0.0:
+        return start_c2w.clone()
+    if t >= 1.0:
+        return end_c2w.clone()
+    start_c2w = start_c2w.to(dtype=torch.float32)
+    end_c2w = end_c2w.to(dtype=torch.float32, device=start_c2w.device)
+    q0 = _matrix_to_quaternion(start_c2w[:3, :3])
+    q1 = _matrix_to_quaternion(end_c2w[:3, :3])
+    rotation = _quaternion_to_matrix(_slerp_quaternion(q0, q1, float(t)))
+    translation = (1.0 - float(t)) * start_c2w[:3, 3] + float(t) * end_c2w[:3, 3]
+    result = end_c2w.clone()
+    result[:3, :3] = rotation
+    result[:3, 3] = translation
+    return result
+
+
+def _camera_at_time(camera, start_c2w, start_time, end_time, time_value):
+    if abs(end_time - start_time) < 1e-8:
+        c2w = camera.c2w
+    else:
+        alpha = (float(time_value) - start_time) / (end_time - start_time)
+        c2w = _interpolate_c2w(start_c2w, camera.c2w, max(0.0, min(float(alpha), 1.0)))
+    return CameraState(
+        width=camera.width,
+        height=camera.height,
+        fovx=camera.fovx,
+        fovy=camera.fovy,
+        c2w=c2w,
+        image=camera.image,
+        mask=camera.mask,
+        time=float(time_value),
+        last_c2w=camera.last_c2w,
+        last_time=camera.last_time,
+    )
+
+
+def _batch_to_world_space(batch):
+    pose = batch.T_to_world.to(device=batch.rays_ori.device, dtype=batch.rays_ori.dtype)
+    rotation = pose[:, :3, :3]
+    translation = pose[:, :3, 3]
+    rays_ori = torch.einsum("bij,bhwj->bhwi", rotation, batch.rays_ori) + translation[:, None, None, :]
+    rays_dir = torch.einsum("bij,bhwj->bhwi", rotation, batch.rays_dir)
+    identity = torch.eye(4, dtype=batch.rays_ori.dtype, device=batch.rays_ori.device).reshape(1, 4, 4).expand(pose.shape[0], 4, 4)
+    return type(batch)(
+        rays_ori=rays_ori.contiguous(),
+        rays_dir=rays_dir.contiguous(),
+        T_to_world=identity.contiguous(),
+        rgb_gt=batch.rgb_gt,
+        mask=batch.mask,
+        intrinsics=batch.intrinsics,
+        intrinsics_OpenCVPinholeCameraModelParameters=batch.intrinsics_OpenCVPinholeCameraModelParameters,
+        intrinsics_OpenCVFisheyeCameraModelParameters=batch.intrinsics_OpenCVFisheyeCameraModelParameters,
+        intrinsics_BlenderFisheyeCameraModelParameters=batch.intrinsics_BlenderFisheyeCameraModelParameters,
+    )
 
 
 def create_tracer(mode, config):
@@ -57,6 +188,77 @@ def render_gaussian_state(
     device = gaussians.positions.device
     timings = {}
     start = _profile_now(device) if profile else None
+
+    dof_chunk_size = int(getattr(effects, "dof_spp_chunk_size", 0) or 0)
+    if effects.dof is not None and dof_chunk_size > 0 and dof_chunk_size < int(effects.dof.get_spp()):
+        total_spp = int(effects.dof.get_spp())
+        tracer.build_acc_custom(
+            positions=gaussians.positions,
+            rotations=gaussians.rotations,
+            scales=gaussians.scales,
+            densities=gaussians.densities,
+            rebuild=rebuild,
+        )
+        if profile:
+            now = _profile_now(device)
+            timings["build"] = now - start
+            start = now
+        rgb_sum = None
+        depth_sum = None
+        opacity_sum = None
+        batch_time = 0.0
+        trace_time = 0.0
+        for sample_start in range(1, total_spp + 1, dof_chunk_size):
+            sample_count = min(dof_chunk_size, total_spp - sample_start + 1)
+            chunk_start = _profile_now(device) if profile else None
+            batch = camera_state_to_batch(
+                camera,
+                effects,
+                device=device,
+                use_rolling_shutter=False,
+                dof_sample_start=sample_start,
+                dof_sample_count=sample_count,
+            )
+            if profile:
+                now = _profile_now(device)
+                batch_time += now - chunk_start
+                chunk_start = now
+            render_pkg = tracer.render_custom(
+                positions=gaussians.positions,
+                rotations=gaussians.rotations,
+                scales=gaussians.scales,
+                densities=gaussians.densities,
+                features=gaussians.features,
+                n_active_features=gaussians.active_sh_degree,
+                gpu_batch=batch,
+            )
+            if profile:
+                trace_time += _profile_now(device) - chunk_start
+            rgb_chunk = render_pkg["pred_rgb"].sum(0)
+            depth_chunk = render_pkg["pred_dist"].sum(0)
+            opacity_chunk = render_pkg["pred_opacity"].sum(0)
+            rgb_sum = rgb_chunk if rgb_sum is None else rgb_sum + rgb_chunk
+            depth_sum = depth_chunk if depth_sum is None else depth_sum + depth_chunk
+            opacity_sum = opacity_chunk if opacity_sum is None else opacity_sum + opacity_chunk
+        pred_rgb = (rgb_sum / total_spp).permute(2, 0, 1)
+        pred_depth = (depth_sum / total_spp).permute(2, 0, 1)
+        pred_opacity = (opacity_sum / total_spp).permute(2, 0, 1)
+        if bg_color is not None:
+            pred_rgb = _composite_background(pred_rgb, pred_opacity, bg_color)
+        if profile:
+            timings["batch"] = batch_time
+            timings["trace"] = trace_time
+            timings["format"] = _profile_now(device) - start - batch_time - trace_time if start is not None else 0.0
+            _format_profile("global-dof-chunked", timings)
+        return {
+            "render": pred_rgb,
+            "viewspace_points": None,
+            "visibility_filter": None,
+            "radii": None,
+            "depth": pred_depth,
+            "opacity": pred_opacity,
+            "means3Dfinal": gaussians.positions,
+        }
 
     batch = camera_state_to_batch(
         camera,
@@ -116,8 +318,15 @@ def render_rolling_shutter(
         raise ValueError("camera.time is required for rolling-shutter rendering.")
 
     cur_time = float(camera.time)
-    prev_time = max(0.0, cur_time - rolling_cfg.shutter_time / 2.0)
-    next_time = min(float(rolling_cfg.maxtime), cur_time + rolling_cfg.shutter_time / 2.0)
+    has_previous_camera = camera.last_c2w is not None and camera.last_time is not None
+    if has_previous_camera:
+        prev_time = float(camera.last_time)
+        next_time = cur_time
+        start_c2w = camera.last_c2w
+    else:
+        prev_time = max(0.0, cur_time - rolling_cfg.shutter_time / 2.0)
+        next_time = min(float(rolling_cfg.maxtime), cur_time + rolling_cfg.shutter_time / 2.0)
+        start_c2w = camera.c2w
     total_time = next_time - prev_time
     im_w = int(camera.width)
     im_h = int(camera.height)
@@ -136,8 +345,10 @@ def render_rolling_shutter(
         raise ValueError(f"Unknown shutter type: {rolling_cfg.shutter_type}")
 
     if rolling_cfg.shutter_type == "global":
-        state = state_at_time(float((prev_time + next_time) / 2.0))
-        return render_gaussian_state(tracer, state, camera, effects, bg_color=bg_color, rebuild=rebuild)
+        time_value = float((prev_time + next_time) / 2.0)
+        state = state_at_time(time_value)
+        render_camera = _camera_at_time(camera, start_c2w, prev_time, next_time, time_value) if has_previous_camera else camera
+        return render_gaussian_state(tracer, state, render_camera, effects, bg_color=bg_color, rebuild=rebuild)
 
     rgb_buffer = None
     depth_buffer = None
@@ -160,14 +371,6 @@ def render_rolling_shutter(
 
     total_chunks = len(indices) // row_chunk_size
     progress_interval = max(1, total_chunks // 20)
-    print(
-        f"[rolling-shutter] start image: shutter={rolling_cfg.shutter_type}, "
-        f"axis={axis}, resolution={im_w}x{im_h}, chunks={total_chunks}, "
-        f"chunk_size={row_chunk_size}, rebuild_every={rebuild_every}, "
-        f"state_batch_size={state_batch_size}",
-        flush=True,
-    )
-
     state_queue = {}
 
     def chunk_time(offset, chunk_indices):
@@ -186,7 +389,7 @@ def render_rolling_shutter(
         if len(chunk_indices) != row_chunk_size:
             continue
         chunk_number = idx // row_chunk_size + 1
-        if chunk_number == 1 or chunk_number == total_chunks or chunk_number % progress_interval == 0:
+        if profile and (chunk_number == 1 or chunk_number == total_chunks or chunk_number % progress_interval == 0):
             print(
                 f"[rolling-shutter] {axis} chunk {chunk_number}/{total_chunks} "
                 f"({100.0 * chunk_number / total_chunks:.1f}%)",
@@ -219,14 +422,17 @@ def render_rolling_shutter(
             rgb_buffer = torch.zeros((im_h, im_w, 3), dtype=torch.float32, device=state.positions.device)
             depth_buffer = torch.zeros((im_h, im_w, 1), dtype=torch.float32, device=state.positions.device)
             opacity_buffer = torch.zeros((im_h, im_w, 1), dtype=torch.float32, device=state.positions.device)
-            base_batch = camera_state_to_batch(camera, effects, device=state.positions.device)
-            flat_index_chunks = [
-                _rolling_flat_indices(axis, indices[offset : offset + row_chunk_size], im_w, im_h, state.positions.device)
-                for offset in range(0, len(indices), row_chunk_size)
-                if len(indices[offset : offset + row_chunk_size]) == row_chunk_size
-            ]
+            if not has_previous_camera:
+                base_batch = camera_state_to_batch(camera, effects, device=state.positions.device)
+            flat_index_chunks = _rolling_flat_index_chunks(axis, indices, row_chunk_size, im_w, im_h, state.positions.device)
 
-        batch = slice_batch_flat_indices(batch=base_batch, flat_indices=flat_index_chunks[chunk_number - 1], make_square=True)
+        if has_previous_camera:
+            chunk_camera = _camera_at_time(camera, start_c2w, prev_time, next_time, time_value)
+            chunk_base_batch = camera_state_to_batch(chunk_camera, effects, device=state.positions.device)
+            chunk_base_batch = _batch_to_world_space(chunk_base_batch)
+        else:
+            chunk_base_batch = base_batch
+        batch = slice_batch_flat_indices(batch=chunk_base_batch, flat_indices=flat_index_chunks[chunk_number - 1], make_square=True)
         if profile:
             now = _profile_now(state.positions.device)
             timings["batch"] += now - start
@@ -283,7 +489,6 @@ def render_rolling_shutter(
             depth_buffer[:, start:end] = row_depth
             opacity_buffer[:, start:end] = row_opacity
 
-    print("[rolling-shutter] finished image", flush=True)
     if profile:
         _format_profile("rolling-shutter", timings)
 

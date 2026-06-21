@@ -33,7 +33,7 @@ struct RawParameters : IDifferentiable {
 };
 
 struct RawParametersBuffer {
-    Ptr<RawParameters, Access.Read> _dataPtr;
+    Ptr<RawParameters> _dataPtr;
     RawParameters *_gradPtr;
     bool exclusiveGradient; //< true if the gradient maybe updated without atomics
 };

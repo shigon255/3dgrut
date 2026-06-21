@@ -123,12 +123,14 @@ def camera_state_from_fourdgs(camera):
     w2c[3, 3] = 1.0
     c2w = torch.tensor(np.linalg.inv(w2c), dtype=torch.float32)
     last_c2w = None
+    last_time = None
     if getattr(camera, "last_camera", None) is not None:
         last_w2c = np.zeros((4, 4), dtype=np.float32)
         last_w2c[:3, 3] = camera.last_camera.T
         last_w2c[:3, :3] = camera.last_camera.R.transpose()
         last_w2c[3, 3] = 1.0
         last_c2w = torch.tensor(np.linalg.inv(last_w2c), dtype=torch.float32)
+        last_time = float(camera.last_camera.time)
     return CameraState(
         width=int(camera.image_width),
         height=int(camera.image_height),
@@ -139,6 +141,7 @@ def camera_state_from_fourdgs(camera):
         mask=getattr(camera, "mask", None),
         time=float(camera.time),
         last_c2w=last_c2w,
+        last_time=last_time,
     )
 
 

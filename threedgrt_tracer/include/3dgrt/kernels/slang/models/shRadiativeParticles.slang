@@ -26,7 +26,7 @@ namespace shRadiativeParticle
 
 struct ParametersBuffer
 {
-    Ptr<vector<float, Dim>, Access.Read> _dataPtr;
+    Ptr<vector<float, Dim>> _dataPtr;
     vector<float, Dim> *_gradPtr;
     bool exclusiveGradient; //< true if the gradient maybe updated without atomics
 };

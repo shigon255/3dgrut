@@ -30,3 +30,4 @@ class RenderEffects:
     rolling_shutter: Optional[RollingShutterConfig] = None
     cache_camera_batches: bool = True
     profile: bool = False
+    dof_spp_chunk_size: int = 0
