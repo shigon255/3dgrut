@@ -76,6 +76,42 @@ fromOpenCVFisheyeCameraModelParameters(std::array<uint64_t, 2> _resolution,
     return params;
 }
 
+threedgut::CameraModelParameters
+fromBlenderFisheyeCameraModelParameters(std::array<uint64_t, 2> resolution,
+                                        threedgut::TSensorModel::ShutterType shutter_type,
+                                        std::array<float, 2> principal_point,
+                                        std::array<float, 5> radial_coeffs,
+                                        float sensor_width_mm,
+                                        float sensor_height_mm,
+                                        float fisheye_fov_deg) {
+    threedgut::CameraModelParameters params;
+    params.shutterType = static_cast<threedgut::TSensorModel::ShutterType>(shutter_type);
+    params.modelType   = threedgut::TSensorModel::BlenderFisheyeModel;
+
+    // Replicate the aspect-ratio normalization from generate_lens_polynomial_rays_bl():
+    //   if W >= H:  sensor_height_mm = sensor_width_mm * H / W
+    //   else:       sensor_width_mm  = sensor_height_mm * W / H
+    // After adjustment W/adj_sw == H/adj_sh (uniform pixels_per_mm).
+    const float W = static_cast<float>(resolution[0]);
+    const float H = static_cast<float>(resolution[1]);
+    float adj_sw = sensor_width_mm;
+    float adj_sh = sensor_height_mm;
+    if (W >= H) {
+        adj_sh = sensor_width_mm * H / W;
+    } else {
+        adj_sw = sensor_height_mm * W / H;
+    }
+    const float pixels_per_mm = W / adj_sw; // == H / adj_sh after adjustment
+
+    static_assert(sizeof(principal_point) == sizeof(tcnn::vec2), "[3dgut] typing size mismatch");
+    static_assert(sizeof(radial_coeffs) == sizeof(tcnn::vec<5>), "[3dgut] typing size mismatch");
+    params.blenderFisheyeParams.principalPoint = *reinterpret_cast<const tcnn::vec2*>(principal_point.data());
+    params.blenderFisheyeParams.pixelsPerMm    = pixels_per_mm;
+    params.blenderFisheyeParams.radialCoeffs   = *reinterpret_cast<const tcnn::vec<5>*>(radial_coeffs.data());
+    params.blenderFisheyeParams.maxAngle       = fisheye_fov_deg * static_cast<float>(M_PI) / 180.f / 2.f;
+    return params;
+}
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
 
     pybind11::class_<SplatRaster>(m, "SplatRaster")
@@ -110,4 +146,13 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           py::arg("focal_length"),
           py::arg("radial_coeffs"),
           py::arg("max_angle"));
+
+    m.def("fromBlenderFisheyeCameraModelParameters", &fromBlenderFisheyeCameraModelParameters,
+          py::arg("resolution"),
+          py::arg("shutter_type"),
+          py::arg("principal_point"),
+          py::arg("radial_coeffs"),
+          py::arg("sensor_width_mm"),
+          py::arg("sensor_height_mm"),
+          py::arg("fisheye_fov_deg"));
 }

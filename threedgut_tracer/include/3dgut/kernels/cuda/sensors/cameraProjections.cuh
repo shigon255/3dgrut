@@ -127,6 +127,56 @@ static inline __device__ bool projectPoint(const OpenCVFisheyeProjectionParamete
     return (theta < sensorParams.maxAngle) && withinResolution(resolution, tolerance, projected);
 }
 
+// Blender fisheye lens polynomial (forward model in adapter):
+//   theta = k0 + k1*r + k2*r^2 + k3*r^3 + k4*r^4   (r in mm, theta in radians)
+//
+// Projection is the analytic inverse: given a 3D point, compute theta from the 3D angle,
+// invert the polynomial to get r_mm (Newton iterations), then apply the pixel scale.
+// This exactly matches generate_lens_polynomial_rays_bl() in the Python adapter.
+static inline __device__ bool projectPoint(const BlenderFisheyeProjectionParameters& sensorParams,
+                                           const tcnn::ivec2& resolution,
+                                           const tcnn::vec3& position,
+                                           float tolerance,
+                                           tcnn::vec2& projected) {
+    constexpr float eps = __FLT_EPSILON__;
+
+    // Step 1: compute angle from optical axis
+    const float rho       = fmaxf(tcnn::length(position.xy()), eps);
+    const float thetaFull = atan2f(rho, position.z);
+
+    // Points beyond the FOV cone are invalid (same convention as adapter's torch.where mask)
+    if (thetaFull >= sensorParams.maxAngle) {
+        projected = sensorParams.principalPoint;
+        return false;
+    }
+
+    // Step 2: invert theta = poly(r_mm) via Newton's method
+    // poly'(r) = k1 + 2*k2*r + 3*k3*r^2 + 4*k4*r^3
+    const float k1 = sensorParams.radialCoeffs[1];
+    float r_mm = thetaFull / fmaxf(k1, eps); // initial guess: ignore higher-order terms
+#pragma unroll
+    for (int i = 0; i < 10; ++i) {
+        const float poly = sensorParams.radialCoeffs[0]
+                         + r_mm * (sensorParams.radialCoeffs[1]
+                         + r_mm * (sensorParams.radialCoeffs[2]
+                         + r_mm * (sensorParams.radialCoeffs[3]
+                         + r_mm *  sensorParams.radialCoeffs[4])));
+        const float dpoly = sensorParams.radialCoeffs[1]
+                          + r_mm * (2.f * sensorParams.radialCoeffs[2]
+                          + r_mm * (3.f * sensorParams.radialCoeffs[3]
+                          + r_mm *  4.f * sensorParams.radialCoeffs[4]));
+        r_mm -= (poly - thetaFull) / fmaxf(dpoly, eps);
+        r_mm  = fmaxf(r_mm, 0.f);
+    }
+
+    // Step 3: project onto the image plane
+    // cos(phi) = position.x / rho,  sin(phi) = position.y / rho
+    projected = sensorParams.principalPoint
+              + sensorParams.pixelsPerMm * r_mm * tcnn::vec2{position.x / rho, position.y / rho};
+
+    return withinResolution(tcnn::vec2{(float)resolution.x, (float)resolution.y}, tolerance, projected);
+}
+
 static inline __device__ bool projectPoint(const TSensorModel& sensorModel,
                                            const tcnn::ivec2& resolution,
                                            const tcnn::vec3& position,
@@ -137,6 +187,8 @@ static inline __device__ bool projectPoint(const TSensorModel& sensorModel,
         return projectPoint(sensorModel.ocvPinholeParams, resolution, position, tolerance, projected);
     case TSensorModel::OpenCVFisheyeModel:
         return projectPoint(sensorModel.ocvFisheyeParams, resolution, position, tolerance, projected);
+    case TSensorModel::BlenderFisheyeModel:
+        return projectPoint(sensorModel.blenderFisheyeParams, resolution, position, tolerance, projected);
     default:
         projected = tcnn::vec2::zero();
         return false;

@@ -35,6 +35,16 @@ struct OpenCVFisheyeProjectionParameters {
     float maxAngle;
 };
 
+// Blender lens polynomial: theta_rad = k0 + k1*r + k2*r^2 + k3*r^3 + k4*r^4
+// where r is in mm (sensor space) and theta is the angle from optical axis in radians.
+// pixelsPerMm: uniform pixel-per-mm scale after aspect-ratio normalization (W/sensor_width_mm).
+struct BlenderFisheyeProjectionParameters {
+    tcnn::vec2   principalPoint; // [cx, cy] in pixels (typically [W/2, H/2])
+    float        pixelsPerMm;    // uniform scale: pixels / mm (same for both axes after aspect adjustment)
+    tcnn::vec<5> radialCoeffs;   // k0..k4; polynomial outputs theta in radians
+    float        maxAngle;       // half-FoV in radians (= fisheye_fov_deg * pi/360)
+};
+
 struct CameraModelParameters {
     enum ShutterType {
         RollingTopToBottomShutter,
@@ -47,13 +57,15 @@ struct CameraModelParameters {
     enum ModelType {
         OpenCVPinholeModel,
         OpenCVFisheyeModel,
+        BlenderFisheyeModel,
         EmptyModel,
         Unsupported
     } modelType = EmptyModel;
 
     union {
-        OpenCVPinholeProjectionParameters ocvPinholeParams;
-        OpenCVFisheyeProjectionParameters ocvFisheyeParams;
+        OpenCVPinholeProjectionParameters  ocvPinholeParams;
+        OpenCVFisheyeProjectionParameters  ocvFisheyeParams;
+        BlenderFisheyeProjectionParameters blenderFisheyeParams;
     };
 };
 

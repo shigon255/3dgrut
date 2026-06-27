@@ -565,18 +565,22 @@ class Tracer:
             resolution = K["resolution"]
             resolution_np = resolution if isinstance(resolution, np.ndarray) else np.array(resolution)
             principal_point = K.get("principal_point", resolution_np.astype(np.float32) / 2)
-            focal_length = K.get("focal_length", np.array([resolution_np[0], resolution_np[1]], dtype=np.float32))
-            radial_coeffs = K.get("radial_coeffs", np.zeros((4,), dtype=np.float32))
-            radial_coeffs = np.asarray(radial_coeffs, dtype=np.float32)[:4]
-            if radial_coeffs.shape[0] < 4:
-                radial_coeffs = np.pad(radial_coeffs, (0, 4 - radial_coeffs.shape[0]))
-            camera_model_parameters = _3dgut_plugin.fromOpenCVFisheyeCameraModelParameters(
-                resolution=resolution,
+            # Prefer the raw Blender coefficients (k0..k4, theta in radians); fall back to radial_coeffs.
+            blender_coeffs = np.asarray(
+                K.get("blender_coeffs", K.get("radial_coeffs", np.zeros(5, dtype=np.float32))),
+                dtype=np.float32,
+            )
+            if blender_coeffs.shape[0] < 5:
+                blender_coeffs = np.pad(blender_coeffs, (0, 5 - blender_coeffs.shape[0]))
+            blender_coeffs = blender_coeffs[:5]
+            camera_model_parameters = _3dgut_plugin.fromBlenderFisheyeCameraModelParameters(
+                resolution=resolution_np.astype(np.uint64).tolist(),
                 shutter_type=SHUTTER_TYPE_MAP[K["shutter_type"]],
-                principal_point=principal_point,
-                focal_length=focal_length,
-                radial_coeffs=radial_coeffs,
-                max_angle=K.get("max_angle", float(K.get("fisheye_fov_deg", 180.0)) * math.pi / 180.0 / 2.0),
+                principal_point=principal_point.tolist() if hasattr(principal_point, "tolist") else list(principal_point),
+                radial_coeffs=blender_coeffs.tolist(),
+                sensor_width_mm=float(K.get("sensor_width_mm", 36.0)),
+                sensor_height_mm=float(K.get("sensor_height_mm", 36.0)),
+                fisheye_fov_deg=float(K.get("fisheye_fov_deg", 180.0)),
             )
             return camera_model_parameters, pose_model.get_sensor_pose()
 
