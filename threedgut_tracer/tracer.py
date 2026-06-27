@@ -556,7 +556,7 @@ class Tracer:
                 shutter_type=SHUTTER_TYPE_MAP[K["shutter_type"]],
                 principal_point=K["principal_point"],
                 focal_length=K["focal_length"],
-                radial_coeffs=K["radial_coeffs"],
+                radial_coeffs=list(K["radial_coeffs"])[:4],  # OpenCV fisheye takes exactly 4 coeffs (k1-k4)
                 max_angle=K["max_angle"],
             )
             return camera_model_parameters, pose_model.get_sensor_pose()
