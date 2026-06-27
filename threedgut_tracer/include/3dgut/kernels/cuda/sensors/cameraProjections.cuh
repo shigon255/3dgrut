@@ -144,16 +144,17 @@ static inline __device__ bool projectPoint(const BlenderFisheyeProjectionParamet
     const float rho       = fmaxf(tcnn::length(position.xy()), eps);
     const float thetaFull = atan2f(rho, position.z);
 
-    // Points beyond the FOV cone are invalid (same convention as adapter's torch.where mask)
-    if (thetaFull >= sensorParams.maxAngle) {
-        projected = sensorParams.principalPoint;
-        return false;
-    }
-
-    // Step 2: invert theta = poly(r_mm) via Newton's method
+    // Step 2: invert theta = poly(r_mm) via Newton's method.
+    // For out-of-FOV points, clamp to maxAngle and invert that — the resulting projected
+    // position is at the FOV boundary circle rather than at the image center.  This mirrors
+    // the OpenCV-fisheye convention and prevents the UT covariance from exploding when a
+    // sigma point just barely misses the FOV, which would otherwise produce blocky artifacts
+    // across large tile regions.
+    //
     // poly'(r) = k1 + 2*k2*r + 3*k3*r^2 + 4*k4*r^3
+    const float thetaClamped = fminf(thetaFull, sensorParams.maxAngle);
     const float k1 = sensorParams.radialCoeffs[1];
-    float r_mm = thetaFull / fmaxf(k1, eps); // initial guess: ignore higher-order terms
+    float r_mm = thetaClamped / fmaxf(k1, eps); // initial guess: ignore higher-order terms
 #pragma unroll
     for (int i = 0; i < 10; ++i) {
         const float poly = sensorParams.radialCoeffs[0]
@@ -165,7 +166,7 @@ static inline __device__ bool projectPoint(const BlenderFisheyeProjectionParamet
                           + r_mm * (2.f * sensorParams.radialCoeffs[2]
                           + r_mm * (3.f * sensorParams.radialCoeffs[3]
                           + r_mm *  4.f * sensorParams.radialCoeffs[4]));
-        r_mm -= (poly - thetaFull) / fmaxf(dpoly, eps);
+        r_mm -= (poly - thetaClamped) / fmaxf(dpoly, eps);
         r_mm  = fmaxf(r_mm, 0.f);
     }
 
@@ -174,7 +175,9 @@ static inline __device__ bool projectPoint(const BlenderFisheyeProjectionParamet
     projected = sensorParams.principalPoint
               + sensorParams.pixelsPerMm * r_mm * tcnn::vec2{position.x / rho, position.y / rho};
 
-    return withinResolution(tcnn::vec2{(float)resolution.x, (float)resolution.y}, tolerance, projected);
+    // Points truly beyond maxAngle are invalid; the clamped projection keeps the value
+    // bounded near the FOV boundary so UT covariance estimates stay sane.
+    return (thetaFull < sensorParams.maxAngle) && withinResolution(tcnn::vec2{(float)resolution.x, (float)resolution.y}, tolerance, projected);
 }
 
 static inline __device__ bool projectPoint(const TSensorModel& sensorModel,
