@@ -175,9 +175,13 @@ static inline __device__ bool projectPoint(const BlenderFisheyeProjectionParamet
     projected = sensorParams.principalPoint
               + sensorParams.pixelsPerMm * r_mm * tcnn::vec2{position.x / rho, position.y / rho};
 
-    // Points truly beyond maxAngle are invalid; the clamped projection keeps the value
-    // bounded near the FOV boundary so UT covariance estimates stay sane.
-    return (thetaFull < sensorParams.maxAngle) && withinResolution(tcnn::vec2{(float)resolution.x, (float)resolution.y}, tolerance, projected);
+    // "Valid" means the point is in front of the camera (thetaFull < maxAngle).
+    // We intentionally exclude withinResolution here: sigma points at theta < maxAngle
+    // that fall outside the image boundary already have correct extrapolated positions
+    // (no theta clamping applied since thetaFull < maxAngle), so they should be included
+    // in the UT covariance estimate rather than collapsed to the boundary circle.
+    // Only truly behind-camera points (theta >= maxAngle) are marked invalid and excluded.
+    return (thetaFull < sensorParams.maxAngle);
 }
 
 static inline __device__ bool projectPoint(const TSensorModel& sensorModel,

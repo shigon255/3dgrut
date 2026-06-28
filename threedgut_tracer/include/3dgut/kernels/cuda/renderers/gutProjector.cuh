@@ -197,27 +197,49 @@ struct GUTProjector : Params, UTParams {
             return false;
         }
 
-        // Compute projected center from all sigma points (original UT formulation).
-        particleProjCenter = projectedSigmaPoints[0] * (Lambda / (UTParams::D + Lambda));
+        // Compute projected center using only valid (in-front-of-camera) sigma points.
+        // Invalid sigma points are behind the camera (theta >= maxAngle); their positions
+        // are clamped to the FOV boundary circle and must not bias the UT mean/covariance.
+        // In-front-of-camera sigma points outside the image boundary are valid and have
+        // correct extrapolated positions (projectPoint does not clamp for theta < maxAngle).
+        {
+            constexpr float weight0Center = Lambda / (UTParams::D + Lambda);
+            float totalCenterWeight       = validSigmaPoints[0] ? weight0Center : 0.f;
+            particleProjCenter            = validSigmaPoints[0]
+                                              ? projectedSigmaPoints[0] * weight0Center
+                                              : tcnn::vec2{0.f, 0.f};
 #pragma unroll
-        for (int i = 0; i < 2 * UTParams::D; ++i) {
-            particleProjCenter += weightI * projectedSigmaPoints[i + 1];
+            for (int i = 0; i < 2 * UTParams::D; ++i) {
+                if (validSigmaPoints[i + 1]) {
+                    particleProjCenter  += weightI * projectedSigmaPoints[i + 1];
+                    totalCenterWeight   += weightI;
+                }
+            }
+            if (totalCenterWeight > 0.f) {
+                particleProjCenter /= totalCenterWeight;
+            }
         }
 
-        // Compute covariance from all sigma points (original UT formulation).
+        // Compute covariance using only valid sigma points.
         {
-            constexpr float weight0        = Lambda / (UTParams::D + Lambda) + (1.f - UTParams::Alpha * UTParams::Alpha + UTParams::Beta);
-            const tcnn::vec2 centeredPoint = projectedSigmaPoints[0] - particleProjCenter;
-            particleProjCovariance         = weight0 * tcnn::vec3(centeredPoint.x * centeredPoint.x,
-                                                                  centeredPoint.x * centeredPoint.y,
-                                                                  centeredPoint.y * centeredPoint.y);
-        }
+            constexpr float weight0 = Lambda / (UTParams::D + Lambda) + (1.f - UTParams::Alpha * UTParams::Alpha + UTParams::Beta);
+            if (validSigmaPoints[0]) {
+                const tcnn::vec2 centeredPoint = projectedSigmaPoints[0] - particleProjCenter;
+                particleProjCovariance         = weight0 * tcnn::vec3(centeredPoint.x * centeredPoint.x,
+                                                                      centeredPoint.x * centeredPoint.y,
+                                                                      centeredPoint.y * centeredPoint.y);
+            } else {
+                particleProjCovariance = tcnn::vec3{0.f, 0.f, 0.f};
+            }
 #pragma unroll
-        for (int i = 0; i < 2 * UTParams::D; ++i) {
-            const tcnn::vec2 centeredPoint = projectedSigmaPoints[i + 1] - particleProjCenter;
-            particleProjCovariance += weightI * tcnn::vec3(centeredPoint.x * centeredPoint.x,
-                                                           centeredPoint.x * centeredPoint.y,
-                                                           centeredPoint.y * centeredPoint.y);
+            for (int i = 0; i < 2 * UTParams::D; ++i) {
+                if (validSigmaPoints[i + 1]) {
+                    const tcnn::vec2 centeredPoint = projectedSigmaPoints[i + 1] - particleProjCenter;
+                    particleProjCovariance += weightI * tcnn::vec3(centeredPoint.x * centeredPoint.x,
+                                                                   centeredPoint.x * centeredPoint.y,
+                                                                   centeredPoint.y * centeredPoint.y);
+                }
+            }
         }
 
         return true;
