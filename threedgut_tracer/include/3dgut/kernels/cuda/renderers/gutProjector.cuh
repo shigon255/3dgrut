@@ -197,49 +197,27 @@ struct GUTProjector : Params, UTParams {
             return false;
         }
 
-        // Compute projected center using only valid sigma points (renormalised weights).
-        // Invalid sigma points' out-of-bounds projected positions are excluded to prevent
-        // them from biasing the UT mean and inflating the projected covariance, which
-        // would cause wrong tile binning and block-shaped rendering artefacts at the
-        // fisheye image periphery (where Gaussian sigma points straddle the image boundary).
-        {
-            constexpr float weight0Center = Lambda / (UTParams::D + Lambda);
-            float totalCenterWeight       = validSigmaPoints[0] ? weight0Center : 0.f;
-            particleProjCenter            = validSigmaPoints[0]
-                                              ? projectedSigmaPoints[0] * weight0Center
-                                              : tcnn::vec2{0.f, 0.f};
+        // Compute projected center from all sigma points (original UT formulation).
+        particleProjCenter = projectedSigmaPoints[0] * (Lambda / (UTParams::D + Lambda));
 #pragma unroll
-            for (int i = 0; i < 2 * UTParams::D; ++i) {
-                if (validSigmaPoints[i + 1]) {
-                    particleProjCenter  += weightI * projectedSigmaPoints[i + 1];
-                    totalCenterWeight   += weightI;
-                }
-            }
-            if (totalCenterWeight > 0.f) {
-                particleProjCenter /= totalCenterWeight;
-            }
+        for (int i = 0; i < 2 * UTParams::D; ++i) {
+            particleProjCenter += weightI * projectedSigmaPoints[i + 1];
         }
 
-        // Compute covariance using only valid sigma points (no weight renormalisation).
+        // Compute covariance from all sigma points (original UT formulation).
         {
-            constexpr float weight0 = Lambda / (UTParams::D + Lambda) + (1.f - UTParams::Alpha * UTParams::Alpha + UTParams::Beta);
-            if (validSigmaPoints[0]) {
-                const tcnn::vec2 centeredPoint = projectedSigmaPoints[0] - particleProjCenter;
-                particleProjCovariance         = weight0 * tcnn::vec3(centeredPoint.x * centeredPoint.x,
-                                                                      centeredPoint.x * centeredPoint.y,
-                                                                      centeredPoint.y * centeredPoint.y);
-            } else {
-                particleProjCovariance = tcnn::vec3{0.f, 0.f, 0.f};
-            }
+            constexpr float weight0        = Lambda / (UTParams::D + Lambda) + (1.f - UTParams::Alpha * UTParams::Alpha + UTParams::Beta);
+            const tcnn::vec2 centeredPoint = projectedSigmaPoints[0] - particleProjCenter;
+            particleProjCovariance         = weight0 * tcnn::vec3(centeredPoint.x * centeredPoint.x,
+                                                                  centeredPoint.x * centeredPoint.y,
+                                                                  centeredPoint.y * centeredPoint.y);
+        }
 #pragma unroll
-            for (int i = 0; i < 2 * UTParams::D; ++i) {
-                if (validSigmaPoints[i + 1]) {
-                    const tcnn::vec2 centeredPoint = projectedSigmaPoints[i + 1] - particleProjCenter;
-                    particleProjCovariance += weightI * tcnn::vec3(centeredPoint.x * centeredPoint.x,
-                                                                   centeredPoint.x * centeredPoint.y,
-                                                                   centeredPoint.y * centeredPoint.y);
-                }
-            }
+        for (int i = 0; i < 2 * UTParams::D; ++i) {
+            const tcnn::vec2 centeredPoint = projectedSigmaPoints[i + 1] - particleProjCenter;
+            particleProjCovariance += weightI * tcnn::vec3(centeredPoint.x * centeredPoint.x,
+                                                           centeredPoint.x * centeredPoint.y,
+                                                           centeredPoint.y * centeredPoint.y);
         }
 
         return true;
