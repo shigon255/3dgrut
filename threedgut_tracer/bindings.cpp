@@ -108,7 +108,26 @@ fromBlenderFisheyeCameraModelParameters(std::array<uint64_t, 2> resolution,
     params.blenderFisheyeParams.principalPoint = *reinterpret_cast<const tcnn::vec2*>(principal_point.data());
     params.blenderFisheyeParams.pixelsPerMm    = pixels_per_mm;
     params.blenderFisheyeParams.radialCoeffs   = *reinterpret_cast<const tcnn::vec<5>*>(radial_coeffs.data());
-    params.blenderFisheyeParams.maxAngle       = fisheye_fov_deg * static_cast<float>(M_PI) / 180.f / 2.f;
+
+    // maxAngle = the true captured half-FOV = the Blender lens polynomial evaluated at the
+    // sensor CORNER (largest r_mm any pixel maps to), NOT fisheye_fov_deg/2.
+    //
+    // The per-pixel rays (image_points_to_camera_rays_blender_mm) map the corner pixel to
+    // r_mm = corner_px / pixels_per_mm and take theta = poly(r_mm); for this lens/sensor that
+    // is ~61 deg, well below fisheye_fov_deg/2 = 90 deg, so the rays only ever cover 0..~61 deg.
+    // If maxAngle is left at 90 deg, UT sigma points in the 61..90 deg "dead zone" (in front of
+    // the camera but beyond any real pixel) are treated as valid and project out to ~440px,
+    // inflating the projected covariance of peripheral Gaussians and producing tile-aligned
+    // block artifacts near the image border. Matching maxAngle to the ray FOV makes the tiling
+    // consistent with ray casting and excludes that dead zone (via the theta < maxAngle check
+    // in projectPoint + the valid-sigma-point filtering in gutProjector).
+    const float corner_px  = 0.5f * sqrtf(W * W + H * H);
+    const float corner_mm  = corner_px / pixels_per_mm;
+    const auto& kc         = params.blenderFisheyeParams.radialCoeffs;
+    const float maxAnglePoly = kc[0] + corner_mm * (kc[1] + corner_mm * (kc[2] + corner_mm * (kc[3] + corner_mm * kc[4])));
+    const float fovHalf      = fisheye_fov_deg * static_cast<float>(M_PI) / 180.f / 2.f;
+    // Clamp into (0, fov/2] for safety against degenerate / non-monotonic coefficient sets.
+    params.blenderFisheyeParams.maxAngle = fminf(fmaxf(maxAnglePoly, 1e-3f), fovHalf);
     return params;
 }
 
