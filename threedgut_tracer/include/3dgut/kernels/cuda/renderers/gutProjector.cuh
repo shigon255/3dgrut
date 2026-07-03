@@ -105,7 +105,12 @@ struct GUTProjector : Params, UTParams {
         }
 
         maxConicOpacityPower     = logf(conicOpacity.w / Params::AlphaThreshold);
-        const float extentFactor = Params::TightOpacityBounding ? fminf(3.33f, sqrtf(2.0f * maxConicOpacityPower)) : 3.33f;
+        // ExtentFactorCap default (3.33) matches upstream. For strongly nonlinear projections
+        // (fisheye), the UT-estimated covariance can still underestimate a thin/anisotropic
+        // Gaussian's true curved footprint even with rect_bounding/tight_opacity_bounding off;
+        // raising this cap (render.splat.extent_factor_cap) widens the safety margin. Left at
+        // the default for other camera models to avoid unnecessary tile-list bloat.
+        const float extentFactor = Params::TightOpacityBounding ? fminf(Params::ExtentFactorCap, sqrtf(2.0f * maxConicOpacityPower)) : Params::ExtentFactorCap;
         const float minLambda    = 0.01f;
         const float mid          = 0.5f * (dilatedCovariance.x + dilatedCovariance.z);
         const float lambda       = mid + sqrtf(fmaxf(minLambda, mid * mid - dilatedCovDet));

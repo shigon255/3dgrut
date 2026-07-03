@@ -52,6 +52,7 @@ def add_3dgut_params(parser: ArgumentParser):
     group.add_argument("--render.splat.rect_bounding", type=str2bool, nargs="?", const=True, default=True)
     group.add_argument("--render.splat.tight_opacity_bounding", type=str2bool, nargs="?", const=True, default=True)
     group.add_argument("--render.splat.tile_based_culling", type=str2bool, nargs="?", const=True, default=True)
+    group.add_argument("--render.splat.extent_factor_cap", type=float, default=3.33, help="Cap on the projected-extent safety-margin multiplier. Raise for strongly nonlinear (e.g. fisheye) projections where thin/anisotropic Gaussians' true curved footprint can exceed the default cap.")
     group.add_argument("--render.splat.n_rolling_shutter_iterations", type=int, default=5)
     group.add_argument("--render.splat.ut_alpha", type=float, default=1.0)
     group.add_argument("--render.splat.ut_beta", type=float, default=2.0)

@@ -71,6 +71,7 @@ def setup_3dgut(conf):
         f"-DGAUSSIAN_RECT_BOUNDING={to_cpp_bool(conf.render.splat.rect_bounding)}",
         f"-DGAUSSIAN_TIGHT_OPACITY_BOUNDING={to_cpp_bool(conf.render.splat.tight_opacity_bounding)}",
         f"-DGAUSSIAN_TILE_BASED_CULLING={to_cpp_bool(conf.render.splat.tile_based_culling)}",
+        f"-DGAUSSIAN_EXTENT_FACTOR_CAP={getattr(conf.render.splat, 'extent_factor_cap', 3.33)}",
     ]
 
     cflags = [
