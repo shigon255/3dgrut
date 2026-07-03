@@ -115,6 +115,11 @@ __global__ void render(threedgut::RenderParameters params,
 }
 
 // Fine-grained load balancing rendering kernel: static allocation per virtual tile
+// Guarded to match the launch site in gutRenderer.cu (`#if FINE_GRAINED_LOAD_BALANCING`).
+// evalForwardNoKBufferBalanced (called below) static_asserts KHitBufferSize == 0; without
+// this guard the kernel is always compiled even when never launched, so any build with
+// k_buffer_size > 0 fails regardless of fine_grained_load_balancing's runtime value.
+#if FINE_GRAINED_LOAD_BALANCING
 __global__ void renderBalanced(threedgut::RenderParameters params,
                                        const tcnn::uvec2* __restrict__ sortedTileRangeIndicesPtr,
                                        const uint32_t* __restrict__ sortedTileDataPtr,
@@ -208,11 +213,12 @@ __global__ void renderBalanced(threedgut::RenderParameters params,
         // Write final results to output buffers
         // Only lane 0 should write, as only it has accumulated the correct values
         if (laneId == 0) {
-            finalizeRay(ray, params, sensorRayOriginPtr, worldHitCountPtr, 
+            finalizeRay(ray, params, sensorRayOriginPtr, worldHitCountPtr,
                         worldHitDistancePtr, radianceDensityPtr, sensorToWorldTransform);
         }
     }
 }
+#endif // FINE_GRAINED_LOAD_BALANCING
 
 __global__ void renderBackward(threedgut::RenderParameters params,
                                const tcnn::uvec2* __restrict__ sortedTileRangeIndicesPtr,
