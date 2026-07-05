@@ -7,6 +7,12 @@
   <img width="100%" src="assets/nvidia-hq-playground.gif">
 </p>
 
+> **Fork notice**: This is a fork of [nv-tlabs/3dgrut](https://github.com/nv-tlabs/3dgrut), adapted for the
+> **4DGRT** project to support additional camera effects (fisheye, rolling shutter, depth of field) used in
+> 4DGRT's dataset generation and rendering pipeline. It is consumed as a submodule of the main
+> [4DGRT repository](https://github.com/shigon255/4DGRT). See [`4DGRT_MODIFICATIONS.md`](4DGRT_MODIFICATIONS.md)
+> for a full list of changes on top of upstream. The original README follows below.
+
 This repository provides the official implementations of **3D Gaussian Ray Tracing (3DGRT)** and **3D Gaussian Unscented Transform (3DGUT)**. Unlike traditional methods that rely on splatting, 3DGRT performs ray tracing of volumetric Gaussian particles instead. This enables support for distorted cameras with complex, time-dependent effects such as rolling shutters, while also efficiently simulating secondary rays required for rendering phenomena like reflection, refraction, and shadows. However, 3DGRT requires dedicated ray-tracing hardware and remains slower than 3DGS.
 
 To mitigate this limitation, we also propose 3DGUT, which enables support for distorted cameras with complex, time-dependent effects within a rasterization framework, maintaining the efficiency of rasterization methods. By aligning the rendering formulations of 3DGRT and 3DGUT, we introduce a hybrid approach called **3DGRUT**. This technique allows for rendering primary rays via rasterization and secondary rays via ray tracing, combining the strengths of both methods for improved performance and flexibility.
