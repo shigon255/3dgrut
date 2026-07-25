@@ -1,3 +1,5 @@
+import types
+
 import numpy as np
 import torch
 
@@ -127,6 +129,10 @@ def create_fisheye_camera(
     shutter_type=ShutterType.GLOBAL,
 ):
     radial_coeffs = [0.0, 1.0, 0.03, 0.001, 0.0] if radial_coeffs is None else list(radial_coeffs)
+    if len(radial_coeffs) != 5:
+        raise ValueError("fisheye radial_coeffs must contain exactly five coefficients")
+    if BlenderFisheyeCameraModelParameters is None:
+        raise ImportError("BlenderFisheyeCameraModelParameters is required for fisheye cameras")
     u = np.tile(np.arange(w), h)
     v = np.arange(h).repeat(w)
     out_shape = (1, h, w, 3)
@@ -142,18 +148,26 @@ def create_fisheye_camera(
         max_angle = np.max([fov_angle_x, fov_angle_y]) / 2.0
     else:
         max_angle = float(fisheye_fov) * (np.pi / 180.0) / 2.0
-    params = OpenCVFisheyeCameraModelParameters(
+    ray_carrier = types.SimpleNamespace(
         principal_point=principal_point,
-        focal_length=focal_length,
-        radial_coeffs=coeffs,
         resolution=resolution,
+        radial_coeffs=coeffs,
         max_angle=max_angle,
+    )
+    blender_coeffs_rad = np.asarray(coeffs, dtype=np.float32) * np.float32(np.pi / 180.0)
+    fisheye_fov_deg = float(fisheye_fov) if fisheye_fov is not None else float(np.rad2deg(2.0 * max_angle))
+    params = BlenderFisheyeCameraModelParameters(
+        resolution=resolution,
         shutter_type=shutter_type,
+        blender_coeffs=blender_coeffs_rad,
+        sensor_width_mm=float(sensor_width_mm),
+        sensor_height_mm=float(sensor_height_mm),
+        fisheye_fov_deg=fisheye_fov_deg,
     )
     pixel_coords = torch.tensor(np.stack([u, v], axis=1), dtype=torch.int32)
     image_points = pixels_to_image_points(pixel_coords)
     rays_d_cam = image_points_to_camera_rays_blender_mm(
-        params, image_points, sensor_size_mm=(sensor_width_mm, sensor_height_mm), device="cpu"
+        ray_carrier, image_points, sensor_size_mm=(sensor_width_mm, sensor_height_mm), device="cpu"
     )
     rays_o_cam = torch.zeros_like(rays_d_cam)
     return (
