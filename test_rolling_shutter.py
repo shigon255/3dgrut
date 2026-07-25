@@ -94,3 +94,53 @@ def test_rolling_shutter_places_and_covers_a_partial_final_column_chunk(monkeypa
     assert torch.equal(output["render"][0, :, :3], torch.ones((2, 3)))
     assert torch.equal(output["render"][0, :, 3:], torch.full((2, 2), 2.0))
     assert torch.all(output["opacity"] > 0)
+
+
+@pytest.mark.parametrize(
+    ("shutter_type", "width", "height"),
+    [
+        ("rolling_lr", 1, 2),
+        ("rolling_rl", 1, 2),
+        ("rolling_tb", 2, 1),
+        ("rolling_bt", 2, 1),
+    ],
+)
+def test_rolling_shutter_uses_midpoint_for_a_unit_scan_axis(
+    monkeypatch, shutter_type, width, height
+):
+    monkeypatch.setattr(
+        rolling_renderer, "camera_state_to_batch", lambda *args, **kwargs: SimpleNamespace()
+    )
+    monkeypatch.setattr(rolling_renderer, "_batch_to_world_space", lambda batch: batch)
+    monkeypatch.setattr(
+        rolling_renderer,
+        "slice_batch_flat_indices",
+        lambda *, flat_indices, **kwargs: SimpleNamespace(flat_indices=flat_indices),
+    )
+
+    class FakeTracer:
+        def build_acc_custom(self, **kwargs):
+            return None
+
+        def render_custom(self, *, gpu_batch, **kwargs):
+            pixels = gpu_batch.flat_indices.numel()
+            return {
+                "pred_rgb": torch.ones((1, pixels, 3)),
+                "pred_dist": torch.ones((1, pixels, 1)),
+                "pred_opacity": torch.ones((1, pixels, 1)),
+            }
+
+    sampled_times = []
+
+    def state_at_time(value):
+        sampled_times.append(value)
+        return _state()
+
+    output = rolling_renderer.render_rolling_shutter(
+        FakeTracer(), state_at_time, _camera(width, height), RenderEffects(),
+        RollingShutterConfig(shutter_type=shutter_type, row_chunk_size=1, rebuild_every=1),
+    )
+
+    assert sampled_times == pytest.approx([0.5])
+    assert torch.all(output["render"] == 1)
+    assert torch.all(output["opacity"] == 1)

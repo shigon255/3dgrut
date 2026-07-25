@@ -333,6 +333,10 @@ def render_rolling_shutter(
     def row_time(x, y):
         if rolling_cfg.shutter_type == "global":
             return float((prev_time + next_time) / 2.0)
+        if rolling_cfg.shutter_type in ("rolling_tb", "rolling_bt") and im_h == 1:
+            return float((prev_time + next_time) / 2.0)
+        if rolling_cfg.shutter_type in ("rolling_lr", "rolling_rl") and im_w == 1:
+            return float((prev_time + next_time) / 2.0)
         if rolling_cfg.shutter_type == "rolling_tb":
             return float(float(math.floor(y)) / (im_h - 1) * total_time + prev_time)
         if rolling_cfg.shutter_type == "rolling_bt":
