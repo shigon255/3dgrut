@@ -44,7 +44,6 @@ def _rolling_flat_index_chunks(axis, indices, row_chunk_size, im_w, im_h, device
     chunks = [
         _rolling_flat_indices(axis, indices[offset : offset + row_chunk_size], im_w, im_h, device)
         for offset in range(0, len(indices), row_chunk_size)
-        if len(indices[offset : offset + row_chunk_size]) == row_chunk_size
     ]
     if len(_ROLLING_INDEX_CHUNKS_CACHE) >= _MAX_ROLLING_INDEX_CHUNKS_CACHE_SIZE:
         _ROLLING_INDEX_CHUNKS_CACHE.pop(next(iter(_ROLLING_INDEX_CHUNKS_CACHE)))
@@ -369,7 +368,7 @@ def render_rolling_shutter(
     if row_chunk_size <= 0 or rebuild_every <= 0 or state_batch_size <= 0:
         raise ValueError("row_chunk_size, rebuild_every, and state_batch_size must be positive.")
 
-    total_chunks = len(indices) // row_chunk_size
+    total_chunks = (len(indices) + row_chunk_size - 1) // row_chunk_size
     progress_interval = max(1, total_chunks // 20)
     state_queue = {}
 
@@ -379,15 +378,14 @@ def render_rolling_shutter(
                 row_time(chunk_idx if axis == "col" else 0, chunk_idx if axis == "row" else 0)
                 for chunk_idx in chunk_indices
             ]
-            value = sum(times) / row_chunk_size
+            value = sum(times) / len(chunk_indices)
         else:
             value = row_time(offset if axis == "col" else 0, offset if axis == "row" else 0)
         return max(prev_time, min(float(value), next_time))
 
     for idx in range(0, len(indices), row_chunk_size):
         chunk_indices = indices[idx : idx + row_chunk_size]
-        if len(chunk_indices) != row_chunk_size:
-            continue
+        chunk_size = len(chunk_indices)
         chunk_number = idx // row_chunk_size + 1
         if profile and (chunk_number == 1 or chunk_number == total_chunks or chunk_number % progress_interval == 0):
             print(
@@ -404,8 +402,6 @@ def render_rolling_shutter(
                 group_times = []
                 for group_offset in group_offsets:
                     group_indices = indices[group_offset : group_offset + row_chunk_size]
-                    if len(group_indices) != row_chunk_size:
-                        continue
                     group_number = group_offset // row_chunk_size + 1
                     group_records.append(group_number)
                     group_times.append(chunk_time(group_offset, group_indices))
@@ -461,7 +457,7 @@ def render_rolling_shutter(
         if profile:
             timings["trace"] += _profile_now(state.positions.device) - start
         batch_size = row_pkg["pred_rgb"].shape[0]
-        expected_pixels = row_chunk_size * (im_w if axis == "row" else im_h)
+        expected_pixels = chunk_size * (im_w if axis == "row" else im_h)
 
         def crop_padded_chunk(tensor, channels):
             flattened = tensor.reshape(batch_size, -1, channels)
@@ -472,14 +468,14 @@ def render_rolling_shutter(
                 )
             averaged = flattened[:, :expected_pixels, :].mean(0)
             if axis == "row":
-                return averaged.reshape(row_chunk_size, im_w, channels)
-            return averaged.reshape(im_h, row_chunk_size, channels)
+                return averaged.reshape(chunk_size, im_w, channels)
+            return averaged.reshape(im_h, chunk_size, channels)
 
         row_rgb = crop_padded_chunk(row_pkg["pred_rgb"], 3)
         row_depth = crop_padded_chunk(row_pkg["pred_dist"], 1)
         row_opacity = crop_padded_chunk(row_pkg["pred_opacity"], 1)
         start = idx
-        end = idx + row_chunk_size
+        end = idx + chunk_size
         if axis == "row":
             rgb_buffer[start:end, :] = row_rgb
             depth_buffer[start:end, :] = row_depth
